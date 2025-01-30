@@ -512,7 +512,7 @@ def main():
 
         # If we have a param_map, color the T1 surfaces
         if param_map is not None and os.path.exists(param_map):
-            print("[STEP] Coloring T1 surfaces ...")
+            print("\n[STEP] Coloring T1 surfaces ...")
             if use_mid:
                 print("[INFO] Sampling param on midthickness, then copying to pial")
                 # LH
