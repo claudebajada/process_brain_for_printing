@@ -32,10 +32,11 @@ A Python command-line tool to prepare, merge, and optionally color 3D brain surf
    - **[MRtrix3](https://www.mrtrix.org/)** (for `warpinit`, `mrcat`)  
 
 4. **Anatomical/Surfaces Data**:  
-   - Processed T1w images and surfaces in both T1 and MNI spaces (e.g., outputs from fMRIPrep or FreeSurfer-based pipelines).  
+   - Processed T1w images and surfaces in both T1 and MNI spaces  
    - Correct GIFTI surfaces for left and right pial, optionally mid-thickness surfaces.  
    - A labeled NIfTI file (e.g., `*_desc-aseg_dseg.nii.gz`) for the brainstem extraction.  
-   - Transform files (`*.h5`) for warping between T1 and MNI spaces.  
+   - Transform files (`*.h5`) for warping between T1 and MNI spaces.
+   - Outputs must be from the fMRIPrep pipelines. 
 
 ---
 
