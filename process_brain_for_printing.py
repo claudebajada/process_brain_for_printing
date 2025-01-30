@@ -637,22 +637,8 @@ def main():
 
             else:
                 print("\n[STEP] Warping param_map to MNI and projecting it directly")
-                xfm_pattern     = f"{anat_dir}/*_run-01_from-T1w_to-MNI152NLin2009cAsym_mode-image_xfm.h5"
-                mni_ref_pattern = f"{anat_dir}/*_run-01_space-MNI152NLin2009cAsym_*_T1w.nii.gz"
-                t1_to_mni_xfm   = first_match(xfm_pattern)
-                mni_ref_file    = first_match(mni_ref_pattern)
-
-                param_map_mni_out = os.path.join(tmp_dir, "param_map_in_mni.nii.gz")
-                run_cmd([
-                    "antsApplyTransforms", "-d", "3",
-                    "-i", param_map,
-                    "-o", param_map_mni_out,
-                    "-r", mni_ref_file,
-                    "-t", t1_to_mni_xfm,
-                    "-n", "NearestNeighbor"
-                ], verbose=verbose)
-
-                colored_mni = project_param_to_surface(mni_mesh_final, param_map_mni_out, num_colors=num_colors)
+                
+                colored_mni = project_param_to_surface(mni_mesh_final, param_map, num_colors=num_colors)
                 if do_obj:
                     out_obj_mni = os.path.join(output_dir, f"{subject_id}_combined_brain_LH_RH_stem_MNI_colored.obj")
                     colored_mni.export(out_obj_mni, file_type="obj")
@@ -672,4 +658,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
