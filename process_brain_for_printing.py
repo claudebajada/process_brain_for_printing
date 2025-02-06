@@ -545,6 +545,10 @@ def main():
     rh_mni_mesh    = None
     st_mni_mesh    = None
 
+    # Variables to hold warped MNI midthickness surfaces (if applicable)
+    lh_mni_mid_out = None
+    rh_mni_mid_out = None
+
     if do_mni:
         print("\n[STEP] Creating MNI-space surfaces (via warp)")
         # Generate the warp field
@@ -605,7 +609,8 @@ def main():
         # -------------------------------------------------------------------
         # Coloring the MNI surfaces:
         # If T1 was created and param_map was given, we can just copy T1's color.
-        # Otherwise, warp the param_map to MNI and project it directly.
+        # Otherwise, if using midthickness surfaces, sample the param_map on warped MNI midthickness
+        # and copy those colors to the MNI pial surfaces.
         # -------------------------------------------------------------------
         if param_map is not None and os.path.exists(param_map):
             if do_t1 and t1_mesh_final is not None:
@@ -636,15 +641,30 @@ def main():
                 mni_mesh_final = colored_mni
 
             else:
-                print("\n[STEP] Warping param_map to MNI and projecting it directly")
-                
-                colored_mni = project_param_to_surface(mni_mesh_final, param_map, num_colors=num_colors)
-                if do_obj:
-                    out_obj_mni = os.path.join(output_dir, f"{subject_id}_combined_brain_LH_RH_stem_MNI_colored.obj")
-                    colored_mni.export(out_obj_mni, file_type="obj")
-                    print(f"[INFO] Exported MNI colored OBJ => {os.path.basename(out_obj_mni)}")
-
-                mni_mesh_final = colored_mni
+                # New branch: if not copying from T1 but use_midthickness is requested in MNI,
+                # sample the param_map on the warped MNI midthickness surfaces and copy to pial.
+                if use_mid and lh_mni_mid_out is not None and rh_mni_mid_out is not None:
+                    print("\n[STEP] Projecting param_map to MNI using midthickness surfaces and copying to pial")
+                    lh_mni_mid = gifti_to_trimesh(lh_mni_mid_out)
+                    rh_mni_mid = gifti_to_trimesh(rh_mni_mid_out)
+                    lh_mni_mid_colored = project_param_to_surface(lh_mni_mid, param_map, num_colors=num_colors)
+                    rh_mni_mid_colored = project_param_to_surface(rh_mni_mid, param_map, num_colors=num_colors)
+                    copy_vertex_colors(lh_mni_mid_colored, lh_mni_mesh)
+                    copy_vertex_colors(rh_mni_mid_colored, rh_mni_mesh)
+                    colored_mni = lh_mni_mesh + rh_mni_mesh + st_mni_mesh
+                    if do_obj:
+                        out_obj_mni = os.path.join(output_dir, f"{subject_id}_combined_brain_LH_RH_stem_MNI_colored.obj")
+                        colored_mni.export(out_obj_mni, file_type="obj")
+                        print(f"[INFO] Exported MNI colored OBJ => {os.path.basename(out_obj_mni)}")
+                    mni_mesh_final = colored_mni
+                else:
+                    print("\n[STEP] Projecting param_map directly to MNI")
+                    colored_mni = project_param_to_surface(mni_mesh_final, param_map, num_colors=num_colors)
+                    if do_obj:
+                        out_obj_mni = os.path.join(output_dir, f"{subject_id}_combined_brain_LH_RH_stem_MNI_colored.obj")
+                        colored_mni.export(out_obj_mni, file_type="obj")
+                        print(f"[INFO] Exported MNI colored OBJ => {os.path.basename(out_obj_mni)}")
+                    mni_mesh_final = colored_mni
 
     # -----------------------------------------------------------------------
     # C) CLEANUP
