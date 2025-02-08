@@ -112,7 +112,7 @@ def generate_mrtrix_style_warp(mni_file, t1_file, xfm_file, out_warp="warp.nii",
 def warp_gifti_vertices(gifti_file, warp_field_file, output_gifti_file, verbose=False):
     """
     Apply a warp field (4D NIfTI, shape [X, Y, Z, 3]) to each vertex of a GIFTI surface.
-    The warp is in MNI->T1 orientation, so the result is a surface in the T1 space.
+    The warp is in T1 to MNI orientation, so the result is a surface in MNI space.
     """
     print(f"[INFO] Warping GIFTI surface: {os.path.basename(gifti_file)}")
 
