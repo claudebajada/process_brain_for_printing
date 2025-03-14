@@ -44,7 +44,7 @@ A Python command-line tool to prepare, merge, and optionally color 3D brain surf
 
 1. Clone this repository:
    ```bash
-   git clone https://github.com/YourGitHubUsername/brain-for-printing.git
+   git clone https://github.com/claudebajada/brain-for-printing.git
    cd brain-for-printing
    ```
 2. (Optional) Create and activate a Python virtual environment:
