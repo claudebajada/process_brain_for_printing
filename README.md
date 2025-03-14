@@ -42,7 +42,7 @@
 
    ```bash
    git clone https://github.com/claudebajada/process_brain_for_printing.git
-   cd brain_for_printing_pkg
+   cd process_brain_for_printing
    ```
 
 2. Install in **editable mode**:
