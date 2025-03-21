@@ -182,6 +182,17 @@ brain_for_printing_slab_slices \
 - `--subdivide_max_edge`: if set, subdivides each slab’s triangles so no edge is longer than the given size (e.g. 2 mm). This yields a denser mesh for coloring.  
 - Each slab is exported as `slab_000.stl`, `slab_001.stl`, etc.
 
+### 6) Hollow Ventricles
+
+Hollow out the ventricular system from a brain mesh using fMRIPrep outputs:
+
+```bash
+brain_for_printing_hollow_ventricles \
+  --subjects_dir /path/to/derivatives \
+  --subject_id sub-01 \
+  --in_mesh sub-01_T1_brain.stl \
+  --space T1 \
+  --output sub-01_T1_hollowed.stl
 
 ## License
 
