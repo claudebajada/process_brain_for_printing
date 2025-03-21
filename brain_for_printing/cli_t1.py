@@ -17,7 +17,7 @@ from .color_utils import (
 def main():
     parser = argparse.ArgumentParser(
         description="Generate T1-space surfaces for a given subject "
-                    "(LH pial, RH pial, optional brainstem), optionally color them."
+                    "(LH/RH pial or white, optional brainstem), optionally color them."
     )
     parser.add_argument("--subjects_dir", required=True,
         help="Path to derivatives or subject data.")
@@ -34,7 +34,9 @@ def main():
     parser.add_argument("--param_map", default=None,
         help="Path to a param volume in T1 space.")
     parser.add_argument("--use_midthickness", action="store_true",
-        help="If set, param_map is sampled on the mid surface and copied to pial.")
+        help="If set, param_map is sampled on the mid surface and copied to pial/white.")
+    parser.add_argument("--use_white", action="store_true",
+        help="Use white matter surfaces instead of pial surfaces.")
     parser.add_argument("--num_colors", type=int, default=6,
         help="Number of discrete color steps if param_map is provided.")
     parser.add_argument("--export_obj", action="store_true",
@@ -47,18 +49,20 @@ def main():
     do_smooth = not args.no_smooth
     do_clean = not args.no_clean
 
-    # Create a temp folder
     tmp_dir = os.path.join(args.output_dir, f"_tmp_t1_{uuid.uuid4().hex[:6]}")
     os.makedirs(tmp_dir, exist_ok=True)
     print(f"[INFO] Temporary folder => {tmp_dir}")
 
     anat_dir = os.path.join(args.subjects_dir, args.subject_id, "anat")
 
-    # Identify pial surfaces
-    lh_pial_pattern = f"{anat_dir}/*_run-01_hemi-L_pial.surf.gii"
-    rh_pial_pattern = f"{anat_dir}/*_run-01_hemi-R_pial.surf.gii"
-    lh_pial_file = first_match(lh_pial_pattern)
-    rh_pial_file = first_match(rh_pial_pattern)
+    # Determine which surface type to load
+    surf_type = "white" if args.use_white else "pial"
+
+    # Identify surface files
+    lh_surf_pattern = f"{anat_dir}/*_run-01_hemi-L_{surf_type}.surf.gii"
+    rh_surf_pattern = f"{anat_dir}/*_run-01_hemi-R_{surf_type}.surf.gii"
+    lh_surf_file = first_match(lh_surf_pattern)
+    rh_surf_file = first_match(rh_surf_pattern)
 
     # Optionally get mid surfaces if coloring that way
     lh_mid_file = rh_mid_file = None
@@ -68,15 +72,11 @@ def main():
         lh_mid_file = first_match(lh_mid_pattern)
         rh_mid_file = first_match(rh_mid_pattern)
 
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    # 1) Load LH/RH pial surfaces
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    lh_mesh_t1 = gifti_to_trimesh(lh_pial_file)
-    rh_mesh_t1 = gifti_to_trimesh(rh_pial_file)
+    # Load cortical surfaces
+    lh_mesh_t1 = gifti_to_trimesh(lh_surf_file)
+    rh_mesh_t1 = gifti_to_trimesh(rh_surf_file)
 
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    # 2) Extract brainstem (unless skipped)
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Extract brainstem if requested
     st_mesh_t1 = None
     if not args.no_brainstem:
         bs_t1_gii = extract_brainstem_in_t1(
@@ -89,11 +89,9 @@ def main():
             trimesh.repair.fill_holes(st_mesh_t1)
         if do_smooth:
             trimesh.smoothing.filter_taubin(st_mesh_t1, lamb=0.5, nu=-0.53, iterations=10)
-        st_mesh_t1.invert()  # outward normals
+        st_mesh_t1.invert()
 
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    # 3) Combine LH + RH + (Brainstem)
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Combine cortical + brainstem
     if st_mesh_t1:
         t1_mesh_final = lh_mesh_t1 + rh_mesh_t1 + st_mesh_t1
     else:
@@ -103,27 +101,24 @@ def main():
     t1_mesh_final.export(out_stl, file_type="stl")
     print(f"[INFO] Exported => {out_stl}")
 
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    # 4) (Optional) Param map coloring
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Optional param map coloring
     if args.param_map:
         if args.use_midthickness:
-            # Color LH
             lh_colored = color_pial_from_midthickness(
-                lh_pial_file, lh_mid_file, args.param_map,
+                lh_surf_file, lh_mid_file, args.param_map,
                 num_colors=args.num_colors
             )
-            # Color RH
             rh_colored = color_pial_from_midthickness(
-                rh_pial_file, rh_mid_file, args.param_map,
+                rh_surf_file, rh_mid_file, args.param_map,
                 num_colors=args.num_colors
             )
         else:
-            # Direct projection on pial
-            lh_colored = project_param_to_surface(lh_mesh_t1, args.param_map,
-                                                  num_colors=args.num_colors)
-            rh_colored = project_param_to_surface(rh_mesh_t1, args.param_map,
-                                                  num_colors=args.num_colors)
+            lh_colored = project_param_to_surface(
+                lh_mesh_t1, args.param_map, num_colors=args.num_colors
+            )
+            rh_colored = project_param_to_surface(
+                rh_mesh_t1, args.param_map, num_colors=args.num_colors
+            )
 
         if st_mesh_t1:
             colored_t1 = lh_colored + rh_colored + st_mesh_t1
@@ -135,11 +130,8 @@ def main():
             colored_t1.export(out_obj, file_type="obj")
             print(f"[INFO] Exported => {out_obj}")
 
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    # 5) Cleanup
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    # Cleanup
     if do_clean:
         shutil.rmtree(tmp_dir, ignore_errors=True)
     else:
         print(f"[INFO] Temporary folder retained => {tmp_dir}")
-
