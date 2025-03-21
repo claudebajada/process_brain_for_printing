@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "brain_for_printing"
+version = "0.1.0"
+description = "Generate 3D-printable brain surfaces (pial + brainstem) in T1/MNI space"
+readme = "README.md"
+requires-python = ">=3.7"
+license = {text = "MIT"}
+authors = [
+  { name="Claude J. Bajada", email="claude.bajada {at} um.edu.mt" }
+]
+keywords = ["3D-printing", "Neuroimaging", "NIfTI", "Freesurfer", "Brain"]
+# Python version requirement (example: 3.7+):
+requires-python = ">=3.7"
+
+# Additional metadata (classifiers, etc.)
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS"
+]
+
+# Dependencies automatically installed by pip
+dependencies = [
+  "numpy",
+  "nibabel",
+  "scipy",
+  "scikit-image",
+  "trimesh",
+  "matplotlib"
+]
+
+[project.scripts]
+# CLI entry points:
+brain_for_printing_t1 = "brain_for_printing.cli_t1:main"
+brain_for_printing_mni = "brain_for_printing.cli_mni:main"
+brain_for_printing_brainstem = "brain_for_printing.cli_brainstem:main"
+brain_for_printing_color = "brain_for_printing.cli_color:main"
+brain_for_printing_slab_slices = "brain_for_printing.cli_slab_slices:main"
+brain_for_printing_hollow_ventricles = "brain_for_printing.cli_hollow_ventricles:main"
+
+[tool.setuptools]
+packages = ["brain_for_printing"]
