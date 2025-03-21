@@ -105,11 +105,13 @@ brain_for_printing_t1 \
   --subjects_dir /path/to/derivatives \
   --subject_id sub-01 \
   --output_dir /path/to/output \
+  --use_white \
   --param_map /path/to/some_T1_volume.nii.gz \
   --use_midthickness \
   --export_obj
 ```
 
+- **`--use_white`**: Use white matter surfaces instead of default pial surfaces.
 - **`--subjects_dir`**: Directory containing `sub-01/anat/`  
 - **`--subject_id`**: Typically the folder name inside `subjects_dir`  
 - **`--no_brainstem`**: If set, skip extracting brainstem  
@@ -128,13 +130,15 @@ brain_for_printing_mni \
   --subjects_dir /path/to/derivatives \
   --subject_id sub-01 \
   --output_dir /path/to/output \
+  --use_white \
   --param_map /path/to/some_T1_volume.nii.gz \
   --use_midthickness \
   --export_obj
 ```
 
 - Creates **LH pial MNI**, **RH pial MNI**, plus brainstem in MNI space.  
-- Exports combined mesh as an STL or OBJ.  
+- Exports combined mesh as an STL or OBJ.
+- Options are the same as for the T1 space.
 
 ### 3) Brainstem Extraction
 
