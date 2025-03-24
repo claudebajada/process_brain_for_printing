@@ -1,0 +1,40 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+brain_for_printing/__pycache__/
+
+# Build / distribution artifacts
+*.egg-info/
+brain_for_printing.egg-info/
+dist/
+build/
+
+# Temporary directories created by CLI tools
+*_tmp_*/
+slabs_out/
+
+# Intermediate or export files
+*.log
+*.tmp
+*.bak
+*.swp
+*.obj
+*.stl
+*.gii
+*.nii.gz
+
+# System-specific files
+.DS_Store
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# IDE/editor config
+.vscode/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
