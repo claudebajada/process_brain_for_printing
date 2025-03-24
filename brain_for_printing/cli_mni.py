@@ -50,7 +50,7 @@ def main():
     anat_dir = os.path.join(args.subjects_dir, args.subject_id, "anat")
 
     # Surface type
-    surf_type = "white" if args.use_white else "pial"
+    surf_type = "smoothwm" if args.use_white else "pial"
 
     # Identify surface files
     lh_surf_pattern = f"{anat_dir}/*_run-01_hemi-L_{surf_type}.surf.gii"

@@ -10,11 +10,10 @@ readme = "README.md"
 requires-python = ">=3.7"
 license = {text = "MIT"}
 authors = [
-  { name="Claude J. Bajada", email="claude.bajada {at} um.edu.mt" }
+  { name="Claude J. Bajada", email="claude.bajada@um.edu.mt" }
 ]
 keywords = ["3D-printing", "Neuroimaging", "NIfTI", "Freesurfer", "Brain"]
 # Python version requirement (example: 3.7+):
-requires-python = ">=3.7"
 
 # Additional metadata (classifiers, etc.)
 classifiers = [
