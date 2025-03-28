@@ -9,7 +9,7 @@ import nibabel as nib
 import numpy as np
 from scipy.ndimage import binary_dilation, binary_erosion, generate_binary_structure
 
-from .mesh_utils import volume_to_gifti, gifti_to_trimesh
+from .mesh_utils import volume_to_gifti, gifti_to_trimesh, voxel_remesh_and_repair
 from .io_utils import first_match, run_cmd
 from .log_utils import write_log
 
@@ -19,48 +19,6 @@ def is_engine_available(engine):
     elif engine == "scad":
         return shutil.which("openscad") is not None
     return True
-
-def repair_and_merge_components(mesh, log, voxel_pitch=1.0, min_volume_threshold=100.0):
-    components = mesh.split(only_watertight=False)
-    if len(components) > 1:
-        msg = f"Ventricle mesh has {len(components)} disconnected parts."
-        print(f"[WARNING] {msg}")
-        log["warnings"].append(msg)
-
-    repaired = []
-    for i, comp in enumerate(components):
-        comp = comp.copy()
-
-        comp.remove_degenerate_faces()
-        comp.remove_unreferenced_vertices()
-        comp.fix_normals()
-        trimesh.repair.fill_holes(comp)
-        trimesh.smoothing.filter_taubin(comp, lamb=0.5, nu=-0.53, iterations=10)
-
-        if not comp.is_volume:
-            print(f"[WARNING] Component {i} is not a volume. Voxelizing...")
-            try:
-                comp_voxel = comp.voxelized(pitch=voxel_pitch)
-                comp = comp_voxel.marching_cubes
-                log["steps"].append(f"Component {i} voxelized with pitch {voxel_pitch}")
-            except Exception as e:
-                msg = f"Voxelization failed on component {i}: {e}"
-                print(f"[ERROR] {msg}")
-                log["warnings"].append(msg)
-                continue
-
-        if comp.volume < min_volume_threshold:
-            print(f"[INFO] Skipping small component {i} (volume={comp.volume:.2f})")
-            continue
-
-        repaired.append(comp)
-
-    if not repaired:
-        raise ValueError("All ventricle components were discarded or failed to process.")
-
-    merged = trimesh.util.concatenate(repaired)
-    log["steps"].append("Repaired and merged ventricle components")
-    return merged
 
 def main():
     parser = argparse.ArgumentParser(
@@ -110,7 +68,6 @@ def main():
     except Exception as e:
         print(f"  • Enclosed volume: [error computing volume] {e}")
 
-    
     log["brain_vertices"] = len(brain_mesh.vertices)
     log["steps"].append("Loaded brain mesh")
 
@@ -144,17 +101,16 @@ def main():
         nib.save(filled_img, vent_mask_nii)
         log["steps"].append("Applied dilation to ventricle mask")
 
-    # Convert mask to surface
+    # Convert ventricle mask to surface
     vent_gii = os.path.join(tmp_dir, "ventricles.surf.gii")
     volume_to_gifti(vent_mask_nii, vent_gii, level=0.5)
     vent_mesh = gifti_to_trimesh(vent_gii)
 
+    # Split ventricle mesh into connected components
     components = vent_mesh.split(only_watertight=False)
-
     filtered = []
 
     print(f"[INFO] Found {len(components)} ventricle components. Inspecting each:")
-
     for i, comp in enumerate(components):
         comp = comp.copy()
         comp.remove_degenerate_faces()
@@ -163,21 +119,19 @@ def main():
 
         if comp.volume < 0:
             print(f"  • Component {i} has negative volume ({comp.volume:.2f}). Inverting...")
-            comp.invert()    
+            comp.invert()
 
         print(f"  • Component {i}: volume = {comp.volume:.2f} mm³ | watertight = {comp.is_watertight} | is_volume = {comp.is_volume}")
 
         if comp.volume < 1.0:
-            print(f"    → Skipping: trivial volume")    
+            print("    → Skipping: trivial volume")
             continue
-
         if not comp.is_volume:
-            print(f"    → Skipping: not a volume")
+            print("    → Skipping: not a volume")
             continue
 
-        print(f"    → Keeping ✅")
+        print("    → Keeping ✅")
         filtered.append(comp)
-
 
     if not filtered:
         raise ValueError("No usable ventricle components found.")
@@ -187,43 +141,16 @@ def main():
         print(f"[WARNING] {msg}")
         log["warnings"].append(msg)
 
+    # Subtract each ventricle component from the brain
     print("[INFO] Performing boolean subtraction (brain - ventricles)...")
     trimesh.constants.DEFAULT_WEAK_ENGINE = args.engine
-    
-    engine = args.engine
-    if engine == "auto":
-        engine = "trimesh"    
-    
-    hollowed = brain_mesh.copy()
+    engine = args.engine if args.engine != "auto" else "trimesh"
 
+    hollowed = brain_mesh.copy()
     for i, vent in enumerate(filtered):
         print(f"[INFO] Subtracting component {i} (volume={vent.volume:.2f})...")
         try:
-            #brain_path = os.path.join(tmp_dir, f"brain_before_component_{i}.stl")
-            #vent_path = os.path.join(tmp_dir, f"vent_component_{i}.stl")
-            #brain_mesh.export(brain_path)
-            #vent.export(vent_path)
-
-            # Make relative paths for OpenSCAD
-            #rel_brain = f"brain_before_component_{i}.stl"
-            #rel_vent = f"vent_component_{i}.stl"
-            
-            #scad_path = os.path.join(tmp_dir, f"subtract_{i}.scad")
-            #with open(scad_path, "w") as f:
-            #    f.write(f"""
-            #difference() {{
-            #  import("{rel_brain}");
-            #  import("{rel_vent}");
-            #}}""")
-            
-            #output_stl = os.path.join(tmp_dir, f"hollowed_component_{i}.stl")
-            #print(f"[DEBUG] Running OpenSCAD: cd {tmp_dir} && openscad -o hollowed_component_{i}.stl subtract_{i}.scad")
-
-            #os.system(f"cd {tmp_dir} && openscad -o hollowed_component_{i}.stl subtract_{i}.scad")
-            
-            
             hollowed = trimesh.boolean.difference([hollowed, vent], engine=engine)
-
             if not hollowed.is_volume or not hollowed.is_watertight:
                 print(f"[WARNING] After subtracting component {i}, mesh is not watertight or not a volume.")
             else:
@@ -232,14 +159,20 @@ def main():
             print(f"[ERROR] Boolean subtraction failed for component {i}: {e}")
             continue
 
-
     print(f"[INFO] Hollowed mesh is watertight? {hollowed.is_watertight}")
+
+    # ---------------------------------------------------------------------
+    # Final voxel remesh if still not watertight
+    # ---------------------------------------------------------------------
     if not hollowed.is_watertight:
         print("[INFO] Attempting final voxel remeshing of hollowed mesh...")
         try:
-            hollowed = hollowed.voxelized(pitch=0.5).fill().marching_cubes
-            trimesh.repair.fill_holes(hollowed)
-            hollowed.fix_normals()
+            hollowed = voxel_remesh_and_repair(
+                hollowed,
+                pitch=0.5,
+                do_smooth=True,
+                smooth_iterations=10
+            )
             print(f"[INFO] Final mesh is watertight? {hollowed.is_watertight}")
         except Exception as e:
             print(f"[ERROR] Final voxel remeshing failed: {e}")
@@ -260,4 +193,8 @@ def main():
         shutil.rmtree(tmp_dir, ignore_errors=True)
     else:
         print(f"[INFO] Temp folder retained => {tmp_dir}")
+
+
+if __name__ == "__main__":
+    main()
 

@@ -7,16 +7,18 @@
 ## Features
 
 1. **Extract & Warp Surfaces**:  
-   - **T1-space** (LH pial, RH pial, brainstem).  
-   - **MNI-space** (same surfaces, plus generation of a warp field).  
+   - **T1 or MNI space** (LH/RH pial or white, optional brainstem).  
 2. **Color Surfaces**:  
    - **Param map projection** (nearest or linear interpolation).  
    - **Mid-thickness sampling** to color pial surfaces.  
+   - **Overlay segmentation + param maps**.  
 3. **Brainstem Extraction**:  
    - Binarize specific labels in a Freesurfer aseg for T1 or MNI.  
 4. **Volumetric Slicing**:  
-   - Slice a 3D STL into multiple slabs along axial/coronal/sagittal orientation, for 3D printing.  
-   - Optionally subdivide each slab’s mesh for denser vertex sampling (useful for coloring).  
+   - Slice a 3D STL into multiple slabs along axial/coronal/sagittal orientation.  
+   - Optionally subdivide each slab’s mesh for denser vertex sampling.  
+5. **Hollowing Ventricles**:  
+   - Subtract ventricles from a brain mesh using fMRIPrep segmentation.  
 
 ---
 
@@ -25,12 +27,11 @@
 - [Installation](#installation)  
 - [Dependencies](#dependencies)  
 - [Usage](#usage)  
-  - [1. T1 Surfaces](#1-t1-surfaces)  
-  - [2. MNI Surfaces](#2-mni-surfaces)  
-  - [3. Brainstem Extraction](#3-brainstem-extraction)  
-  - [4. Coloring Surfaces](#4-coloring-surfaces)  
-  - [5. Volumetric Slicing](#5-volumetric-slicing)
-  - [6. Hollow Ventricles](#6-hollow-ventricles)
+  - [1. Cortical Surfaces (T1 or MNI)](#1-cortical-surfaces-t1-or-mni)  
+  - [2. Brainstem Extraction](#2-brainstem-extraction)  
+  - [3. Coloring Surfaces](#3-coloring-surfaces)  
+  - [4. Volumetric Slicing](#4-volumetric-slicing)
+  - [5. Hollow Ventricles](#5-hollow-ventricles)
 - [Testing](#testing)  
 - [License](#license)  
 - [Acknowledgments](#acknowledgments)  
@@ -91,59 +92,48 @@ Make sure these commands are on your system’s `$PATH` before running the scrip
 
 Once installed, you will have several CLI commands:
 
-- `brain_for_printing_t1`
-- `brain_for_printing_mni`
+- `brain_for_printing_cortical_surfaces`
 - `brain_for_printing_brainstem`
 - `brain_for_printing_color`
 - `brain_for_printing_slab_slices`
+- `brain_for_printing_hollow_ventricles`
+- `brain_for_printing_overlay`
+- `brain_for_printing_brain_mask_surface`
 
-### 1) T1 Surfaces
+---
 
-**Generate T1-space surfaces** (LH pial, RH pial, and optionally brainstem), optionally color them with a param map:
+### 1) Cortical Surfaces (T1 or MNI)
 
-```bash
-brain_for_printing_t1 \
-  --subjects_dir /path/to/derivatives \
-  --subject_id sub-01 \
-  --output_dir /path/to/output \
-  --use_white \
-  --param_map /path/to/some_T1_volume.nii.gz \
-  --use_midthickness \
-  --export_obj
-```
-
-- **`--use_white`**: Use white matter surfaces instead of default pial surfaces.
-- **`--subjects_dir`**: Directory containing `sub-01/anat/`  
-- **`--subject_id`**: Typically the folder name inside `subjects_dir`  
-- **`--no_brainstem`**: If set, skip extracting brainstem  
-- **`--no_fill` / `--no_smooth`**: Skip hole-filling or Taubin smoothing on the brainstem mesh  
-- **`--param_map`**: A NIfTI volume in T1 space to color the pial surfaces  
-- **`--use_midthickness`**: If you have mid-thickness surfaces, color them first then copy color to pial.  
-
-Resulting surfaces are exported as **STL** (and optionally OBJ with vertex colors).
-
-### 2) MNI Surfaces
-
-**Warp T1-space surfaces into MNI** and optionally color them:
+Generate cortical surfaces (LH, RH, and optionally brainstem) in either **T1** or **MNI** space.
 
 ```bash
-brain_for_printing_mni \
+brain_for_printing_cortical_surfaces \
   --subjects_dir /path/to/derivatives \
   --subject_id sub-01 \
+  --space T1 \
   --output_dir /path/to/output \
   --use_white \
-  --param_map /path/to/some_T1_volume.nii.gz \
-  --use_midthickness \
-  --export_obj
+  --no_brainstem \
+  --split_hemis
 ```
 
-- Creates **LH pial MNI**, **RH pial MNI**, plus brainstem in MNI space.  
-- Exports combined mesh as an STL or OBJ.
-- Options are the same as for the T1 space.
+**Arguments**:
+- `--space T1` (default) or `--space MNI`: Output in native or MNI space.
+- `--use_white`: Use white matter surfaces instead of the default pial.
+- `--no_brainstem`: Skip extracting the brainstem surface.
+- `--split_hemis`: Export LH, RH, and brainstem as separate STL files. If not set, a combined mesh is exported.
+- `--no_fill` / `--no_smooth`: Skip hole-filling or smoothing for the brainstem mesh.
+- `--output_dir`: Where to save STL files and the process log.
+- `--verbose`: Print extra information.
+- `--no_clean`: Retain temporary folder.
 
-### 3) Brainstem Extraction
+Use `brain_for_printing_color` or `brain_for_printing_overlay` to color these surfaces after generation.
 
-**Extract only the brainstem** (or your custom label set) in T1 or MNI space:
+---
+
+### 2) Brainstem Extraction
+
+Extract only the brainstem (or your custom label set) in T1 or MNI space:
 
 ```bash
 brain_for_printing_brainstem \
@@ -153,11 +143,11 @@ brain_for_printing_brainstem \
   --output_dir /path/to/output
 ```
 
-You can also do `--space MNI`. By default, it uses a label set in `surfaces.py` with `--inv` logic (be sure to confirm which labels you want to keep or invert).
+---
 
-### 4) Coloring Surfaces
+### 3) Coloring Surfaces
 
-**Project a param map** onto an existing mesh (STL, OBJ, or GIFTI). For instance:
+Color an existing mesh using a parametric volume (NIfTI). Works on STL, OBJ, or GIFTI.
 
 ```bash
 brain_for_printing_color \
@@ -167,11 +157,21 @@ brain_for_printing_color \
   --num_colors 6
 ```
 
-This command creates a new **OBJ** with vertex colors. If the mesh is not dense enough, consider subdividing it or slicing with a smaller maximum edge length first (see “Volumetric Slicing” below).
+To use anatomical segmentation + param overlay, use:
 
-### 5) Volumetric Slicing
+```bash
+brain_for_printing_overlay \
+  --in_mesh mesh.obj \
+  --seg segmentation.nii.gz \
+  --param param_map.nii.gz \
+  --out_obj overlay_colored.obj
+```
 
-**Slice a 3D mesh** into multiple slabs along a chosen orientation (axial, coronal, or sagittal). Each slab is a **3D** sub-mesh, suitable for separate 3D printing. Optionally subdivide to get more vertices for param-map coloring:
+---
+
+### 4) Volumetric Slicing
+
+Slice a 3D mesh into multiple slabs for stackable printing.
 
 ```bash
 brain_for_printing_slab_slices \
@@ -182,12 +182,9 @@ brain_for_printing_slab_slices \
   --out_dir slabs_out
 ```
 
-- Slicing axis: `axial` (Z), `coronal` (Y), `sagittal` (X).  
-- `--thickness`: how many mm (or mesh units) per slab.  
-- `--subdivide_max_edge`: if set, subdivides each slab’s triangles so no edge is longer than the given size (e.g. 2 mm). This yields a denser mesh for coloring.  
-- Each slab is exported as `slab_000.stl`, `slab_001.stl`, etc.
+---
 
-### 6) Hollow Ventricles
+### 5) Hollow Ventricles
 
 Hollow out the ventricular system from a brain mesh using fMRIPrep outputs:
 
@@ -199,6 +196,8 @@ brain_for_printing_hollow_ventricles \
   --space T1 \
   --output sub-01_T1_hollowed.stl
 ```
+
+---
 
 ## License
 
