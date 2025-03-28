@@ -41,6 +41,8 @@ brain_for_printing_brainstem = "brain_for_printing.cli_brainstem:main"
 brain_for_printing_color = "brain_for_printing.cli_color:main"
 brain_for_printing_slab_slices = "brain_for_printing.cli_slab_slices:main"
 brain_for_printing_hollow_ventricles = "brain_for_printing.cli_hollow_ventricles:main"
+brain_for_printing_overlay = "brain_for_printing.cli_overlay:main"
+brain_for_printing_brain_mask_surface = "brain_for_printing.cli_brain_mask_surface:main"
 
 [tool.setuptools]
 packages = ["brain_for_printing"]

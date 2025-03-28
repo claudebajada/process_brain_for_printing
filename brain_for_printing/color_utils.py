@@ -85,4 +85,71 @@ def copy_vertex_colors(mesh_source, mesh_target):
     if len(mesh_source.vertices) != len(mesh_target.vertices):
         raise ValueError("Meshes do not have matching vertex counts!")
     mesh_target.visual.vertex_colors = mesh_source.visual.vertex_colors.copy()
+    
+    
+def color_mesh_with_seg_and_param(mesh, segmentation_img, seg_affine,
+                                  param_img=None, param_affine=None,
+                                  threshold=0.0, num_colors=6):
+    """
+    Colours a mesh using segmentation (5TT or aseg), optionally overridden by param map.
+    """
+
+    def get_seg_color(label):
+        return {
+            0: [255, 190, 120],   # Cortical GM
+            1: [200, 100, 100],   # Subcortical GM
+            2: [255, 255, 255],   # WM
+            3: [180, 180, 255],   # CSF
+            4: [255, 0, 255],     # Pathological
+            42: [150, 150, 150],  # Cortical GM (aseg)
+            2: [150, 150, 150],   # Cortical GM (aseg)
+            41: [255, 255, 255],  # WM (aseg)
+            77: [255, 255, 255],  # WM (aseg)
+            10: [200, 100, 100],  # Thalamus
+            11: [200, 100, 100],  # Caudate
+            12: [200, 100, 100],  # Putamen
+            13: [200, 100, 100],  # Pallidum
+            49: [200, 100, 100],
+            50: [200, 100, 100],
+            51: [200, 100, 100],
+            52: [200, 100, 100],
+            4:  [180, 180, 255],  # CSF
+        }.get(int(label), [100, 100, 100])  # fallback grey
+
+    from scipy.ndimage import map_coordinates
+
+    if segmentation_img.ndim == 4 and segmentation_img.shape[3] == 5:
+        seg_labels = np.argmax(segmentation_img, axis=3)
+    else:
+        seg_labels = segmentation_img
+
+    inv_affine = np.linalg.inv(seg_affine)
+    ones = np.ones((mesh.vertices.shape[0], 1))
+    vert_hom = np.hstack([mesh.vertices, ones])
+    vox_coords = (inv_affine @ vert_hom.T).T[:, :3].T
+    sampled_labels = map_coordinates(seg_labels, vox_coords, order=0, mode='nearest')
+
+    base_colors = np.array([get_seg_color(lbl) for lbl in sampled_labels], dtype=np.uint8)
+
+    if param_img is not None and param_affine is not None:
+        inv_param_aff = np.linalg.inv(param_affine)
+        vox_param = (inv_param_aff @ vert_hom.T).T[:, :3].T
+        param_vals = map_coordinates(param_img, vox_param, order=1, mode='nearest')
+        mask = param_vals > threshold
+
+        if np.any(mask):
+            cmap = matplotlib.colormaps.get_cmap('viridis').resampled(num_colors)
+            pmin, pmax = np.min(param_vals[mask]), np.max(param_vals[mask])
+            bins = np.linspace(pmin, pmax, num_colors + 1)
+
+            for i, val in enumerate(param_vals):
+                if val > threshold:
+                    bin_idx = np.digitize(val, bins) - 1
+                    bin_idx = np.clip(bin_idx, 0, num_colors - 1)
+                    rgb = (np.array(cmap(bin_idx)[:3]) * 255).astype(np.uint8)
+                    base_colors[i] = rgb
+
+    mesh.visual.vertex_colors = base_colors
+    return mesh
+
 

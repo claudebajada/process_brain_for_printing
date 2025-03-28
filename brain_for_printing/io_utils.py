@@ -29,3 +29,11 @@ def first_match(pattern):
         print(f"[WARNING] Multiple files found for {pattern}; using {matches[0]}")
     return matches[0]
 
+def load_nifti(nifti_path):
+    """
+    Load NIfTI file and return data and affine.
+    """
+    import nibabel as nib
+    nii = nib.load(nifti_path)
+    return nii.get_fdata(), nii.affine
+
