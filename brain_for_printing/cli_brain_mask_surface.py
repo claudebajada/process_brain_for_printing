@@ -5,6 +5,9 @@ import argparse
 import uuid
 import shutil
 import trimesh
+import numpy as np
+import nibabel as nib
+from scipy.ndimage import binary_dilation, generate_binary_structure
 
 from .io_utils import first_match, run_cmd
 from .mesh_utils import volume_to_gifti, gifti_to_trimesh
@@ -12,12 +15,14 @@ from .log_utils import write_log
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate a smooth surface from a T1w brain mask (fMRIPrep), optionally warp to MNI."
+        description="Generate a smooth (optionally inflated) surface from a T1w brain mask, optionally warp to MNI."
     )
     parser.add_argument("--subjects_dir", required=True)
     parser.add_argument("--subject_id", required=True)
     parser.add_argument("--output_dir", default=".")
     parser.add_argument("--space", choices=["T1", "MNI"], default="T1")
+    parser.add_argument("--inflate_mm", type=float, default=0.0,
+        help="Amount to inflate the brain mask in mm before creating the surface.")
     parser.add_argument("--no_smooth", action="store_true")
     parser.add_argument("--no_clean", action="store_true")
     args = parser.parse_args()
@@ -33,6 +38,7 @@ def main():
         "subject_id": args.subject_id,
         "output_dir": args.output_dir,
         "space": args.space,
+        "inflate_mm": args.inflate_mm,
         "steps": [],
         "warnings": [],
         "output_files": [],
@@ -44,7 +50,7 @@ def main():
     log["mask_file"] = mask_file
     log["steps"].append("Located T1w brain mask")
 
-    # Warp to MNI if requested
+    # Warp to MNI if needed
     final_mask = mask_file
     if args.space == "MNI":
         xfm_pattern = f"{anat_dir}/*_run-01_from-T1w_to-MNI152NLin2009cAsym_mode-image_xfm.h5"
@@ -62,6 +68,27 @@ def main():
             "-n", "NearestNeighbor"
         ])
         log["steps"].append("Warped brain mask to MNI space")
+
+    # Inflate the binary mask if requested
+    inflated_mask_nii = os.path.join(tmp_dir, "inflated_mask.nii.gz")
+    nii = nib.load(final_mask)
+    mask_data = nii.get_fdata() > 0
+    affine = nii.affine
+
+    if args.inflate_mm > 0.0:
+        voxel_sizes = np.sqrt((affine[:3, :3] ** 2).sum(axis=0))
+        avg_voxel_mm = np.mean(voxel_sizes)
+        n_voxels = int(np.ceil(args.inflate_mm / avg_voxel_mm))
+
+        struct = generate_binary_structure(3, 1)
+        dilated = mask_data.copy()
+        for _ in range(n_voxels):
+            dilated = binary_dilation(dilated, structure=struct)
+
+        inflated_img = nib.Nifti1Image(dilated.astype(np.uint8), affine)
+        nib.save(inflated_img, inflated_mask_nii)
+        log["steps"].append(f"Inflated binary mask by {args.inflate_mm} mm (~{n_voxels} voxels)")
+        final_mask = inflated_mask_nii
 
     # Convert to GIFTI
     out_gii = os.path.join(tmp_dir, "brain_mask_surface.gii")
