@@ -21,6 +21,9 @@ def main():
     parser.add_argument("--num_colors", type=int, default=6, help="Number of discrete parametric colour bins")
     parser.add_argument("--subjects_dir", default=".", help="Used for fallback aseg search")
     parser.add_argument("--subject_id", default=None, help="Used for fallback aseg search")
+    parser.add_argument("--run", default=None, help="Run identifier, e.g., run-01 (optional)")
+    parser.add_argument("--session", default=None, help="Session identifier, e.g., ses-01 (optional)")
+    
     args = parser.parse_args()
 
     # Initialise log
@@ -53,7 +56,17 @@ def main():
         if not args.subject_id:
             raise ValueError("If no segmentation is given, --subject_id must be specified.")
         anat_dir = os.path.join(args.subjects_dir, args.subject_id, "anat")
-        aseg_path = first_match(f"{anat_dir}/*_desc-aseg_dseg.nii.gz")
+        
+        aseg_path = flexible_match(
+            base_dir=anat_dir,
+            subject_id=args.subject_id,
+            descriptor="desc-aseg",
+            suffix="dseg",
+            session=args.session,
+            run=args.run,
+            ext=".nii.gz"
+        )
+        
         seg_img, seg_affine = load_nifti(aseg_path)
         log["steps"].append(f"Loaded fallback aseg from {aseg_path}")
         log["segmentation_type"] = "aseg (3D)"

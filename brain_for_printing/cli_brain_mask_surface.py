@@ -25,6 +25,10 @@ def main():
         help="Amount to inflate the brain mask in mm before creating the surface.")
     parser.add_argument("--no_smooth", action="store_true")
     parser.add_argument("--no_clean", action="store_true")
+    parser.add_argument("--run", default=None, help="Run identifier, e.g., run-01 (optional)")
+    parser.add_argument("--session", default=None, help="Session identifier, e.g., ses-01 (optional)")
+
+    
     args = parser.parse_args()
 
     do_smooth = not args.no_smooth
@@ -45,8 +49,18 @@ def main():
     }
 
     anat_dir = os.path.join(args.subjects_dir, args.subject_id, "anat")
-    mask_pattern = f"{anat_dir}/*_run-01_desc-brain_mask.nii.gz"
-    mask_file = first_match(mask_pattern)
+
+    mask_file = flexible_match(
+        base_dir=anat_dir,
+        subject_id=args.subject_id,
+        descriptor="desc-brain",
+        suffix="mask",
+        session=args.session,
+        run=args.run,
+        ext=".nii.gz"
+    )
+
+
     log["mask_file"] = mask_file
     log["steps"].append("Located T1w brain mask")
 

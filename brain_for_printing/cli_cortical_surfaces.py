@@ -7,6 +7,7 @@ import shutil
 import trimesh
 
 from .io_utils import first_match
+from .io_utils import flexible_match
 from .mesh_utils import gifti_to_trimesh
 from .warp_utils import generate_mrtrix_style_warp, warp_gifti_vertices
 from .surfaces import extract_brainstem_in_t1, extract_brainstem_in_mni
@@ -45,7 +46,11 @@ def main():
         help="If set, do NOT remove the temporary folder at the end.")
     parser.add_argument("--verbose", action="store_true",
         help="If set, prints additional progress messages.")
-
+    parser.add_argument("--run", default=None, 
+        help="Run identifier, e.g., run-01 (optional)")
+    parser.add_argument("--session", default=None, 
+        help="Session identifier, e.g., ses-01 (optional)")
+     
     args = parser.parse_args()
 
     do_fill = not args.no_fill
@@ -77,10 +82,27 @@ def main():
     anat_dir = os.path.join(args.subjects_dir, args.subject_id, "anat")
 
     # Identify LH and RH surfaces (in T1 space)
-    lh_surf_pattern = f"{anat_dir}/*_run-01_hemi-L_{surf_type}.surf.gii"
-    rh_surf_pattern = f"{anat_dir}/*_run-01_hemi-R_{surf_type}.surf.gii"
-    lh_surf_file = first_match(lh_surf_pattern)
-    rh_surf_file = first_match(rh_surf_pattern)
+    lh_surf_file = flexible_match(
+        base_dir=anat_dir,
+        subject_id=args.subject_id,
+        descriptor=None,
+        suffix=f"{surf_type}.surf",
+        hemi="hemi-L",
+        ext=".gii",
+        run=args.run,  
+        session=args.session 
+    )
+
+    rh_surf_file = flexible_match(
+        base_dir=anat_dir,
+        subject_id=args.subject_id,
+        descriptor=None,
+        suffix=f"{surf_type}.surf",
+        hemi="hemi-R",
+        ext=".gii",
+        run=args.run,
+        session=args.session
+    )
 
     log["lh_surf_file"] = lh_surf_file
     log["rh_surf_file"] = rh_surf_file

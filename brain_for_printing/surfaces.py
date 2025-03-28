@@ -57,19 +57,43 @@ def extract_brainstem_in_t1(subjects_dir, subject_id,
 
 
 def extract_brainstem_in_mni(subjects_dir, subject_id,
-                             out_aseg_in_mni, tmp_dir=".", verbose=False):
+                             out_aseg_in_mni, tmp_dir=".", verbose=False, session=None, run=None):
     """
     Warp the aseg from T1 to MNI, binarize, and convert to GIFTI.
 
     """
     anat_dir = os.path.join(subjects_dir, subject_id, "anat")
-    aseg_nii_pattern = f"{anat_dir}/*_run-01_desc-aseg_dseg.nii.gz"
-    xfm_file_pattern = f"{anat_dir}/*_run-01_from-T1w_to-MNI152NLin2009cAsym_mode-image_xfm.h5"
-    mni_template_pattern = f"{anat_dir}/*_run-01_space-MNI152NLin2009cAsym_*_T1w.nii.gz"
 
-    aseg_nii     = first_match(aseg_nii_pattern)
-    xfm_file     = first_match(xfm_file_pattern)
-    mni_template = first_match(mni_template_pattern)
+    aseg_nii = flexible_match(
+        base_dir=anat_dir,
+        subject_id=subject_id,
+        descriptor="desc-aseg",
+        suffix="dseg",
+        session=session,
+        run=run,
+        ext=".nii.gz"
+    )
+
+    xfm_file = flexible_match(
+        base_dir=anat_dir,
+        subject_id=subject_id,
+        descriptor="from-T1w_to-MNI152NLin2009cAsym_mode-image",
+        suffix="xfm",
+        session=session,
+        run=run,
+        ext=".h5"
+    )
+
+    mni_template = flexible_match(
+        base_dir=anat_dir,
+        subject_id=subject_id,
+        descriptor="space-MNI152NLin2009cAsym",
+        suffix="T1w",
+        session=session,
+        run=run,
+        ext=".nii.gz"
+    )
+
 
     # Warp aseg -> MNI
     run_cmd([

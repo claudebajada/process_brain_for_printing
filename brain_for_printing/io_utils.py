@@ -3,6 +3,7 @@
 import glob
 import os
 import subprocess
+import re
 
 def run_cmd(cmd, verbose=False):
     """
@@ -28,6 +29,45 @@ def first_match(pattern):
     if len(matches) > 1:
         print(f"[WARNING] Multiple files found for {pattern}; using {matches[0]}")
     return matches[0]
+
+def flexible_match(base_dir, subject_id, descriptor, suffix, session=None, run=None, hemi=None, ext=".nii.gz"):
+    """
+    Flexibly match files following BIDS conventions.
+
+    Parameters:
+    - base_dir: base directory for files
+    - subject_id: subject identifier (e.g., sub-01)
+    - descriptor: BIDS descriptor (e.g., desc-aseg)
+    - suffix: file suffix (e.g., dseg)
+    - session: optional session identifier (e.g., ses-01)
+    - run: optional run identifier (e.g., run-01)
+    - hemi: optional hemisphere identifier (e.g., hemi-L)
+    - ext: file extension (default ".nii.gz")
+
+    Returns:
+    - First matched file path
+    """
+    pattern = f"{base_dir}/{subject_id}"
+    if session:
+        pattern += f"_{session}"
+    pattern += "*"
+    if run:
+        pattern += f"_{run}"
+    if hemi:
+        pattern += f"_{hemi}"
+    if descriptor:
+        pattern += f"_{descriptor}"
+    if suffix:
+        pattern += f"_{suffix}"
+    pattern += ext
+
+    matches = sorted(glob.glob(pattern))
+    if len(matches) == 0:
+        raise FileNotFoundError(f"No files found for pattern: {pattern}")
+    if len(matches) > 1:
+        print(f"[WARNING] Multiple files found for {pattern}; using {matches[0]}")
+    return matches[0]
+
 
 def load_nifti(nifti_path):
     """

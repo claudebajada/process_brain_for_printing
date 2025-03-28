@@ -33,6 +33,11 @@ def main():
     parser.add_argument("--no_clean", action="store_true")
     parser.add_argument("--dilate_mask", action="store_true",
         help="Apply 3D dilation to the ventricle mask to improve surface integrity.")
+    parser.add_argument("--run", default=None, 
+        help="Run identifier, e.g., run-01 (optional)")
+    parser.add_argument("--session", default=None, 
+        help="Session identifier, e.g., ses-01 (optional)")
+        
     args = parser.parse_args()
 
     tmp_dir = os.path.join(os.path.dirname(args.output), f"_tmp_hollow_{uuid.uuid4().hex[:6]}")
@@ -72,8 +77,17 @@ def main():
     log["steps"].append("Loaded brain mesh")
 
     anat_dir = os.path.join(args.subjects_dir, args.subject_id, "anat")
-    aseg_pattern = f"{anat_dir}/*_run-01_desc-aseg_dseg.nii.gz"
-    aseg_file = first_match(aseg_pattern)
+
+    aseg_file = flexible_match(
+        base_dir=anat_dir,
+        subject_id=args.subject_id,
+        descriptor="desc-aseg",
+        suffix="dseg",
+        session=args.session,
+        run=args.run,
+        ext=".nii.gz"
+    )
+
 
     vent_mask_nii = os.path.join(tmp_dir, f"vent_mask_{args.space}.nii.gz")
     vent_labels = ["4", "5", "14", "15", "43", "44", "72"]
