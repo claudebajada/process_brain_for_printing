@@ -21,8 +21,16 @@ def extract_brainstem_in_t1(subjects_dir, subject_id,
 
     """
     anat_dir = os.path.join(subjects_dir, subject_id, "anat")
-    aseg_nii_pattern = f"{anat_dir}/*_run-01_desc-aseg_dseg.nii.gz"
-    aseg_nii = first_match(aseg_nii_pattern)
+
+    aseg_nii = flexible_match(
+        base_dir=anat_dir,
+        subject_id=subject_id,
+        descriptor="desc-aseg",
+        suffix="dseg",
+        session=session,
+        run=run,
+        ext=".nii.gz"
+    )
 
     t1_brainstem_tmp  = os.path.join(tmp_dir, "brainstem_tmp_T1.nii.gz")
     run_cmd(["mri_convert", aseg_nii, t1_brainstem_tmp], verbose=verbose)

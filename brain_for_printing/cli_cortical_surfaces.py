@@ -173,7 +173,7 @@ def main():
         # MNI-Space Surfaces
         # ==========================
         # Generate the warp field to transform T1->MNI
-        mni_file_pattern = f"{anat_dir}/*_run-01_space-MNI152NLin2009cAsym_*_T1w.nii.gz"
+        mni_file_pattern = f"{anat_dir}/*_run-01_space-MNI152NLin2009cAsym_*_T1w.nii.gz" # NEED TO FIX THESE TO BE FLEXIBLE
         t1_file_pattern  = f"{anat_dir}/*_run-01_desc-preproc_T1w.nii.gz"
         xfm_pattern      = f"{anat_dir}/*_run-01_from-MNI152NLin2009cAsym_to-T1w_mode-image_xfm.h5"
 
