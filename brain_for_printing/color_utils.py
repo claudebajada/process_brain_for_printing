@@ -8,35 +8,54 @@ import trimesh
 
 from .mesh_utils import gifti_to_trimesh
 
-def project_param_to_surface(mesh, param_nifti_path, 
-                             num_colors=6, order=0):
+def project_param_to_surface(
+    mesh: trimesh.Trimesh,
+    param_nifti_path: str,
+    num_colors: int = 6,
+    order: int = 0,
+    threshold: float = None
+) -> trimesh.Trimesh:
     """
-    Sample 'param_nifti' at each vertex, discretize into 'num_colors' bins, 
-    and assign color to each vertex.
-    """
-    print(f"[INFO] Projecting param map '{param_nifti_path}' -> mesh vertices")
-    param_img   = nib.load(param_nifti_path)
-    param_data  = param_img.get_fdata()
-    param_aff   = param_img.affine
+    Sample a param volume (NIfTI) at each vertex of 'mesh', then color
+    the mesh using discrete bins. Optionally apply a threshold so that
+    vertices below threshold get a special alpha or color.
 
-    # Transform each vertex into voxel coordinates
+    Args:
+        mesh (trimesh.Trimesh): The geometry to color in memory.
+        param_nifti_path (str): Path to a NIfTI volume file.
+        num_colors (int): Number of color bins.
+        order (int): Interpolation order (0=nearest, 1=linear, etc.).
+        threshold (float): If set, vertices whose param < threshold will have
+                           alpha=128 (or you can customize).
+
+    Returns:
+        trimesh.Trimesh: The same mesh, now with .visual.vertex_colors set.
+    """
+    param_img  = nib.load(param_nifti_path)
+    param_data = param_img.get_fdata()
+    param_aff  = param_img.affine
+
+    # Convert mesh vertices to voxel coords
     inv_aff = np.linalg.inv(param_aff)
-    verts = mesh.vertices
-    ones  = np.ones((verts.shape[0], 1))
+    verts   = mesh.vertices
+    ones    = np.ones((verts.shape[0], 1), dtype=verts.dtype)
     vert_hom = np.hstack([verts, ones])
     vox_hom  = (inv_aff @ vert_hom.T).T
     vox_xyz  = vox_hom[:, :3]
 
-    # Sample volume
+    # Sample the volume at each vertex
     param_vals = map_coordinates(
         param_data,
         [vox_xyz[:, 0], vox_xyz[:, 1], vox_xyz[:, 2]],
-        order=order, mode='constant', cval=0.0
+        order=order,
+        mode='constant',
+        cval=0.0
     )
 
-    # Discretize param values => color indices
+    # Discretize into color bins
     pmin, pmax = np.min(param_vals), np.max(param_vals)
     if pmin == pmax:
+        # all same param => single color
         color_indices = np.zeros_like(param_vals, dtype=int)
     else:
         bins = np.linspace(pmin, pmax, num_colors + 1)
@@ -44,29 +63,45 @@ def project_param_to_surface(mesh, param_nifti_path,
         color_indices[color_indices < 0] = 0
         color_indices[color_indices >= num_colors] = num_colors - 1
 
-    # Build discrete color table from colormap
+    # Build color table from a colormap (e.g. viridis)
     cmap = matplotlib.colormaps.get_cmap('viridis').resampled(num_colors)
     color_table = (cmap(range(num_colors))[:, :4] * 255).astype(np.uint8)
+
+    # Assign each vertex a color
     vertex_colors = color_table[color_indices]
+
+    # If threshold is provided, handle below-threshold vertices
+    if threshold is not None:
+        below_mask = (param_vals < threshold)
+        # e.g., half-transparency for those below threshold
+        vertex_colors[below_mask, 3] = 128
 
     mesh.visual.vertex_colors = vertex_colors
     return mesh
 
-
-def color_pial_from_midthickness(pial_mesh_file, mid_mesh_file, 
-                                 param_nifti_path, num_colors=6, order=0):
+def color_pial_from_midthickness(
+    pial_mesh_file: str,
+    mid_mesh_file: str,
+    param_nifti_path: str,
+    num_colors: int = 6,
+    order: int = 0,
+    threshold: float = None
+) -> trimesh.Trimesh:
     """
     1) Load mid surface
-    2) Project param map
+    2) Project param map (optionally with threshold)
     3) Copy color to pial surface (1:1 vertex match)
     """
     print(f"[INFO] color_pial_from_midthickness => {pial_mesh_file}")
     mid_mesh = gifti_to_trimesh(mid_mesh_file)
+
+    # Now pass 'threshold' to project_param_to_surface if provided
     mid_colored = project_param_to_surface(
-        mid_mesh,
-        param_nifti_path,
+        mesh=mid_mesh,
+        param_nifti_path=param_nifti_path,
         num_colors=num_colors,
-        order=order
+        order=order,
+        threshold=threshold
     )
 
     pial_mesh = gifti_to_trimesh(pial_mesh_file)
@@ -75,7 +110,6 @@ def color_pial_from_midthickness(pial_mesh_file, mid_mesh_file,
 
     pial_mesh.visual.vertex_colors = mid_colored.visual.vertex_colors.copy()
     return pial_mesh
-
 
 def copy_vertex_colors(mesh_source, mesh_target):
     """
