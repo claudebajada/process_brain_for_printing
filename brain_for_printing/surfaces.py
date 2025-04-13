@@ -25,9 +25,9 @@ def extract_brainstem_in_t1(subjects_dir, subject_id,
     then convert to GIFTI with marching_cubes. Surfaces are stored temporarily and
     returned as a .surf.gii file path.
     """
-    # This import or function depends on your pipeline naming conventions
+    # This import or function depends on the pipeline naming conventions
     # The user might have fMRIPrep aseg: sub-XX_desc-aseg_dseg.nii.gz etc.
-    # Adjust if needed.
+    # May need to adjust, if needed.
     anat_dir = os.path.join(subjects_dir, subject_id, "anat")
 
     aseg_nii = flexible_match(
