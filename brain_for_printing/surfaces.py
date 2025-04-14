@@ -19,7 +19,8 @@ BRAINSTEM_LABELS = [
 ]
 
 def extract_brainstem_in_t1(subjects_dir, subject_id,
-                            tmp_dir=".", verbose=False):
+                            tmp_dir=".", verbose=False,
+                            session=None, run=None):
     """
     Locate and binarize Freesurfer's aseg in T1 space, isolating 'brainstem' region,
     then convert to GIFTI with marching_cubes. Surfaces are stored temporarily and
@@ -73,6 +74,7 @@ def extract_brainstem_in_t1(subjects_dir, subject_id,
 def extract_brainstem_in_mni(subjects_dir, subject_id,
                              out_aseg_in_mni, tmp_dir=".", verbose=False,
                              session=None, run=None):
+
     """
     Warp the Freesurfer aseg from T1 to MNI, binarize, and convert to GIFTI.
     Returns a .surf.gii file path. 
