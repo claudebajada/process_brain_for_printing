@@ -23,15 +23,7 @@ import trimesh
 from .io_utils import run_cmd, flexible_match, first_match
 from .mesh_utils import volume_to_gifti, gifti_to_trimesh
 from .warp_utils import generate_mrtrix_style_warp, warp_gifti_vertices
-
-# ---------------------------------------
-# BRAINSTEM LABELS & EXTRACTION FUNCTIONS
-# ---------------------------------------
-BRAINSTEM_LABELS = [
-    2, 3, 24, 31, 41, 42, 63, 72, 77, 51, 52, 13, 12,
-    43, 50, 4, 11, 26, 58, 49, 10, 17, 18, 53, 54,
-    44, 5, 80, 14, 15, 30, 62
-]
+from .constants import BRAINSTEM_LABELS
 
 def extract_brainstem_in_t1(subjects_dir, subject_id,
                             tmp_dir=".", verbose=False,
