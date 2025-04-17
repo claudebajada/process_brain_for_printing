@@ -29,6 +29,7 @@ def volume_to_gifti(nifti_file, out_gifti, level=0.5):
     verts_vox, faces, _, _ = measure.marching_cubes(
         volume=vol, 
         level=level
+        allow_degenerate=False
     )
 
     # Convert voxel coords -> world coords
