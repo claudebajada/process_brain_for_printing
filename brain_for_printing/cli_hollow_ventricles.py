@@ -1,49 +1,93 @@
+#!/usr/bin/env python
 # brain_for_printing/cli_hollow_ventricles.py
+#
+# Subtract the ventricular system from a brain mesh using fMRIPrep’s aseg
+# segmentation.  Supports optional mask dilation and works in either T1 or MNI
+# space (T1 implemented here).  Implements structured logging, graceful temp‑
+# dir handling, and external‑tool checks.
 
-import os
+from __future__ import annotations
 import argparse
-import uuid
-import shutil
-import trimesh
+import logging
+import os
+from pathlib import Path
+import sys
+
 import nibabel as nib
 import numpy as np
+import trimesh
 from scipy.ndimage import binary_dilation, binary_erosion, generate_binary_structure
 
-from .mesh_utils import volume_to_gifti, gifti_to_trimesh, voxel_remesh_and_repair
-from .io_utils import first_match, run_cmd
-from .log_utils import write_log
+from .io_utils import (
+    flexible_match,
+    first_match,
+    run_cmd,
+    require_cmd,
+    temp_dir,
+)
+from .mesh_utils import (
+    volume_to_gifti,
+    gifti_to_trimesh,
+    voxel_remesh_and_repair,
+)
+from .log_utils import get_logger, write_log
 
-def is_engine_available(engine):
-    if engine == "blender":
-        return shutil.which("blender") is not None
-    elif engine == "scad":
-        return shutil.which("openscad") is not None
-    return True
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Subtract ventricles from a brain mesh using fMRIPrep aseg output."
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+def _build_parser() -> argparse.ArgumentParser:
+    pa = argparse.ArgumentParser(
+        description="Subtract ventricles from a brain mesh using fMRIPrep aseg."
     )
-    parser.add_argument("--subjects_dir", required=True)
-    parser.add_argument("--subject_id", required=True)
-    parser.add_argument("--in_mesh", required=True)
-    parser.add_argument("--space", choices=["T1", "MNI"], default="T1")
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--engine", choices=["scad", "blender", "auto"], default="auto")
-    parser.add_argument("--no_clean", action="store_true")
-    parser.add_argument("--dilate_mask", action="store_true",
-        help="Apply 3D dilation to the ventricle mask to improve surface integrity.")
-    parser.add_argument("--run", default=None, 
-        help="Run identifier, e.g., run-01 (optional)")
-    parser.add_argument("--session", default=None, 
-        help="Session identifier, e.g., ses-01 (optional)")
-        
-    args = parser.parse_args()
+    pa.add_argument("--subjects_dir", required=True, help="BIDS derivatives root.")
+    pa.add_argument("--subject_id", required=True, help="e.g. sub‑01")
+    pa.add_argument("--in_mesh", required=True, help="Path to brain STL/OBJ/GIFTI.")
+    pa.add_argument("--space", choices=["T1", "MNI"], default="T1")
+    pa.add_argument("--output", required=True, help="Output STL path.")
+    pa.add_argument(
+        "--engine",
+        choices=["scad", "blender", "auto"],
+        default="auto",
+        help="Boolean backend for trimesh.",
+    )
+    pa.add_argument(
+        "--dilate_mask",
+        action="store_true",
+        help="Dilate + erode ventricle mask before meshing (helps integrity).",
+    )
+    pa.add_argument("--run", default=None, help="BIDS run‑label if present.")
+    pa.add_argument("--session", default=None, help="BIDS session‑label if present.")
+    pa.add_argument("--no_clean", action="store_true", help="Keep temp folder.")
+    pa.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Print INFO‑level messages and external‑command output.",
+    )
+    return pa
 
-    tmp_dir = os.path.join(os.path.dirname(args.output), f"_tmp_hollow_{uuid.uuid4().hex[:6]}")
-    os.makedirs(tmp_dir, exist_ok=True)
 
-    log = {
+def main() -> None:
+    args = _build_parser().parse_args()
+
+    # ---------- logger ----------
+    log_level = logging.INFO if args.verbose else logging.WARNING
+    L = get_logger(__name__, level=log_level)
+
+    # ---------- external tools ----------
+    require_cmd(
+        "mri_binarize",
+        "https://surfer.nmr.mgh.harvard.edu/",
+        logger=L,
+    )
+    if args.engine == "blender":
+        require_cmd("blender", "https://www.blender.org/", logger=L)
+    elif args.engine == "scad":
+        require_cmd("openscad", "https://openscad.org/", logger=L)
+
+    # ---------- structured JSON log ----------
+    runlog = {
         "tool": "brain_for_printing_hollow_ventricles",
         "subject_id": args.subject_id,
         "space": args.space,
@@ -55,160 +99,101 @@ def main():
         "output_files": [],
     }
 
-    print(f"[INFO] Boolean engine selected: {args.engine}")
-    print(f"[INFO] Blender available: {shutil.which('blender') is not None}")
-    print(f"[INFO] OpenSCAD available: {shutil.which('openscad') is not None}")
+    out_dir = Path(args.output).parent
 
-    print(f"[INFO] Loading brain mesh => {args.in_mesh}")
-    brain_mesh = trimesh.load(args.in_mesh, force='mesh')
-    
-    print("[INFO] Mesh diagnostics:")
-    print(f"  • Is watertight?   {brain_mesh.is_watertight}")
-    print(f"  • Is a volume?     {brain_mesh.is_volume}")
-    print(f"  • # Vertices:      {len(brain_mesh.vertices)}")
-    print(f"  • # Faces:         {len(brain_mesh.faces)}")
-    print(f"  • Surface area:    {brain_mesh.area:.2f} mm²")
-    try:
-        print(f"  • Enclosed volume: {brain_mesh.volume:.2f} mm³")
-    except Exception as e:
-        print(f"  • Enclosed volume: [error computing volume] {e}")
+    with temp_dir("hollow", keep=args.no_clean, base_dir=out_dir) as tmp_dir:
+        L.info("Temporary folder: %s", tmp_dir)
 
-    log["brain_vertices"] = len(brain_mesh.vertices)
-    log["steps"].append("Loaded brain mesh")
+        # ------------------------------------------------------------------ #
+        # Load brain mesh
+        # ------------------------------------------------------------------ #
+        brain_mesh = trimesh.load(args.in_mesh, force="mesh")
+        runlog["brain_vertices"] = len(brain_mesh.vertices)
+        runlog["steps"].append("Loaded brain mesh")
 
-    anat_dir = os.path.join(args.subjects_dir, args.subject_id, "anat")
+        # ------------------------------------------------------------------ #
+        # Locate aseg & create ventricle binary mask
+        # ------------------------------------------------------------------ #
+        anat_dir = Path(args.subjects_dir) / args.subject_id / "anat"
+        aseg_path = flexible_match(
+            base_dir=anat_dir,
+            subject_id=args.subject_id,
+            descriptor="desc-aseg",
+            suffix="dseg",
+            session=args.session,
+            run=args.run,
+            ext=".nii.gz",
+        )
+        vent_mask_nii = Path(tmp_dir) / f"vent_mask_{args.space}.nii.gz"
+        vent_labels = ["4", "5", "14", "15", "43", "44", "72"]
 
-    aseg_file = flexible_match(
-        base_dir=anat_dir,
-        subject_id=args.subject_id,
-        descriptor="desc-aseg",
-        suffix="dseg",
-        session=args.session,
-        run=args.run,
-        ext=".nii.gz"
-    )
+        run_cmd(
+            ["mri_binarize", "--i", aseg_path, "--match", *vent_labels, "--o", vent_mask_nii],
+            verbose=args.verbose,
+        )
+        runlog["steps"].append("Created ventricle binary mask")
 
+        # Optional dilation/erosion
+        if args.dilate_mask:
+            L.info("Dilating ventricle mask …")
+            nii = nib.load(vent_mask_nii)
+            data = nii.get_fdata() > 0
+            struct = generate_binary_structure(3, 2)
+            dil = binary_dilation(data, structure=struct, iterations=2)
+            filled = binary_erosion(dil, structure=struct, iterations=1)
+            vent_mask_nii = Path(tmp_dir) / "vent_mask_filled.nii.gz"
+            nib.save(nib.Nifti1Image(filled.astype(np.uint8), nii.affine), vent_mask_nii)
+            runlog["steps"].append("Dilated / eroded mask")
 
-    vent_mask_nii = os.path.join(tmp_dir, f"vent_mask_{args.space}.nii.gz")
-    vent_labels = ["4", "5", "14", "15", "43", "44", "72"]
+        # ------------------------------------------------------------------ #
+        # Mask → surface mesh
+        # ------------------------------------------------------------------ #
+        vent_gii = Path(tmp_dir) / "ventricles.surf.gii"
+        volume_to_gifti(str(vent_mask_nii), str(vent_gii), level=0.5)
+        vent_mesh = gifti_to_trimesh(str(vent_gii))
+        components = vent_mesh.split(only_watertight=False)
 
-    if args.space == "T1":
-        run_cmd([
-            "mri_binarize",
-            "--i", aseg_file,
-            "--match", *vent_labels,
-            "--o", vent_mask_nii
-        ])
-        log["steps"].append("Created ventricle binary mask using mri_binarize")
-    else:
-        raise NotImplementedError("MNI-space hollowing not implemented yet.")
-
-    if args.dilate_mask:
-        print("[INFO] Applying dilation to ventricle mask...")
-        nii = nib.load(vent_mask_nii)
-        data = nii.get_fdata() > 0
-        structure = generate_binary_structure(3, 2)
-        dilated = binary_dilation(data, structure=structure, iterations=2)
-        filled = binary_erosion(dilated, structure=structure, iterations=1)
-        filled_img = nib.Nifti1Image(filled.astype(np.uint8), affine=nii.affine)
-        vent_mask_nii = os.path.join(tmp_dir, "vent_mask_filled.nii.gz")
-        nib.save(filled_img, vent_mask_nii)
-        log["steps"].append("Applied dilation to ventricle mask")
-
-    # Convert ventricle mask to surface
-    vent_gii = os.path.join(tmp_dir, "ventricles.surf.gii")
-    volume_to_gifti(vent_mask_nii, vent_gii, level=0.5)
-    vent_mesh = gifti_to_trimesh(vent_gii)
-
-    # Split ventricle mesh into connected components
-    components = vent_mesh.split(only_watertight=False)
-    filtered = []
-
-    print(f"[INFO] Found {len(components)} ventricle components. Inspecting each:")
-    for i, comp in enumerate(components):
-        comp = comp.copy()
-        comp.remove_degenerate_faces()
-        comp.remove_unreferenced_vertices()
-        comp.fix_normals()
-
-        if comp.volume < 0:
-            print(f"  • Component {i} has negative volume ({comp.volume:.2f}). Inverting...")
-            comp.invert()
-
-        print(f"  • Component {i}: volume = {comp.volume:.2f} mm³ | watertight = {comp.is_watertight} | is_volume = {comp.is_volume}")
-
-        if comp.volume < 1.0:
-            print("    → Skipping: trivial volume")
-            continue
-        if not comp.is_volume:
-            print("    → Skipping: not a volume")
-            continue
-
-        print("    → Keeping ✅")
-        filtered.append(comp)
-
-    if not filtered:
-        raise ValueError("No usable ventricle components found.")
-
-    if not brain_mesh.is_volume:
-        msg = "Brain mesh is not a volume — boolean may fail."
-        print(f"[WARNING] {msg}")
-        log["warnings"].append(msg)
-
-    # Subtract each ventricle component from the brain
-    print("[INFO] Performing boolean subtraction (brain - ventricles)...")
-    trimesh.constants.DEFAULT_WEAK_ENGINE = args.engine
-    engine = args.engine if args.engine != "auto" else "trimesh"
-
-    hollowed = brain_mesh.copy()
-    for i, vent in enumerate(filtered):
-        print(f"[INFO] Subtracting component {i} (volume={vent.volume:.2f})...")
-        try:
-            hollowed = trimesh.boolean.difference([hollowed, vent], engine=engine)
-            if not hollowed.is_volume or not hollowed.is_watertight:
-                print(f"[WARNING] After subtracting component {i}, mesh is not watertight or not a volume.")
+        # Filter trivial / non‑volume comps
+        kept = []
+        for i, comp in enumerate(components):
+            comp.remove_degenerate_faces()
+            comp.remove_unreferenced_vertices()
+            comp.fix_normals()
+            if comp.volume > 1.0 and comp.is_volume:
+                kept.append(comp)
             else:
-                print(f"[INFO] Subtraction of component {i} successful ✅")
-        except Exception as e:
-            print(f"[ERROR] Boolean subtraction failed for component {i}: {e}")
-            continue
+                L.warning("Skipping ventricle component %d (volume %.2f)", i, comp.volume)
 
-    print(f"[INFO] Hollowed mesh is watertight? {hollowed.is_watertight}")
+        if not kept:
+            sys.exit("No usable ventricle components found.")
 
-    # ---------------------------------------------------------------------
-    # Final voxel remesh if still not watertight
-    # ---------------------------------------------------------------------
-    if not hollowed.is_watertight:
-        print("[INFO] Attempting final voxel remeshing of hollowed mesh...")
-        try:
-            hollowed = voxel_remesh_and_repair(
-                hollowed,
-                pitch=0.5,
-                do_smooth=True,
-                smooth_iterations=10
-            )
-            print(f"[INFO] Final mesh is watertight? {hollowed.is_watertight}")
-        except Exception as e:
-            print(f"[ERROR] Final voxel remeshing failed: {e}")
-            raise
+        # ------------------------------------------------------------------ #
+        # Boolean subtraction
+        # ------------------------------------------------------------------ #
+        trimesh.constants.DEFAULT_WEAK_ENGINE = args.engine
+        engine = None if args.engine == "auto" else args.engine
 
-    if hollowed.is_empty:
-        raise ValueError("Boolean subtraction resulted in empty mesh.")
+        hollow = brain_mesh.copy()
+        for comp in kept:
+            L.info("Subtracting component (vol %.2f mm³)…", comp.volume)
+            try:
+                hollow = trimesh.boolean.difference([hollow, comp], engine=engine)
+            except Exception as exc:
+                L.error("Boolean subtraction failed: %s", exc)
+                runlog["warnings"].append(f"Boolean subtraction failed: {exc}")
 
-    hollowed.export(args.output, file_type="stl")
-    print(f"[INFO] Exported hollowed mesh => {args.output}")
-    log["output_written"] = args.output
-    log["result_vertices"] = len(hollowed.vertices)
-    log["output_files"].append(args.output)
+        if not hollow.is_watertight:
+            L.warning("Result not watertight — attempting voxel remesh")
+            hollow = voxel_remesh_and_repair(hollow, pitch=0.5, do_smooth=True)
 
-    write_log(log, os.path.dirname(args.output), base_name="hollow_log")
+        hollow.export(args.output, file_type="stl")
+        runlog["output_files"].append(args.output)
+        runlog["steps"].append("Exported hollowed mesh")
 
-    if not args.no_clean:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-    else:
-        print(f"[INFO] Temp folder retained => {tmp_dir}")
+    # ---------------- write audit‑log ---------------- #
+    write_log(runlog, out_dir, base_name="hollow_log")
+    L.info("Done.")
 
 
 if __name__ == "__main__":
     main()
-
