@@ -1,142 +1,191 @@
+#!/usr/bin/env python
 # brain_for_printing/cli_cortical_surfaces.py
+#
+# Generate LH / RH cortical surfaces (pial, mid, or white) in T1 or MNI space,
+# optionally add the brainstem, then export as STL — either merged or split.
+# Uses the shared helpers: get_logger(), temp_dir(), require_cmd(), write_log().
 
-import os
+from __future__ import annotations
 import argparse
-import uuid
-import shutil
+import logging
+from pathlib import Path
+from typing import Tuple
+
 import trimesh
 
+from .io_utils import temp_dir, require_cmds
+from .log_utils import get_logger, write_log
 from .surfaces import generate_brain_surfaces
-from .log_utils import write_log
 
-def main():
-    parser = argparse.ArgumentParser(
+
+# --------------------------------------------------------------------------- #
+# CLI argument parser
+# --------------------------------------------------------------------------- #
+def _build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
         description=(
-            "Generate cortical surfaces (LH + RH, optional brainstem) for a subject "
-            "in either T1 or MNI space, optionally splitting hemispheres. "
-            "No coloring is applied here; use brain_for_printing_color or "
-            "brain_for_printing_overlay for coloring."
+            "Generate cortical surfaces (LH + RH, optional brainstem) in either "
+            "T1 or MNI space and export them as STL.  No colouring is done here."
         )
     )
+    ap.add_argument("--subjects_dir", required=True, help="BIDS derivatives root.")
+    ap.add_argument("--subject_id", required=True, help="e.g. sub‑01")
+    ap.add_argument("--space", choices=["T1", "MNI"], default="T1")
+    ap.add_argument(
+        "--surf_type",
+        choices=["pial", "white", "mid"],
+        default="pial",
+        help="Surface type to export.",
+    )
+    ap.add_argument("--output_dir", default=".")
+    ap.add_argument("--no_brainstem", action="store_true")
+    ap.add_argument("--no_fill", action="store_true", help="Skip hole‑filling BS mesh.")
+    ap.add_argument("--no_smooth", action="store_true", help="Skip smoothing BS mesh.")
+    ap.add_argument(
+        "--split_hemis",
+        action="store_true",
+        help="Export LH / RH / BS separately instead of a single merged STL.",
+    )
+    ap.add_argument("--out_warp", default="warp.nii", help="Filename for 4‑D warp.")
+    ap.add_argument("--run", default=None)
+    ap.add_argument("--session", default=None)
+    ap.add_argument("--no_clean", action="store_true", help="Keep temp folder.")
+    ap.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Print INFO‑level messages and external‑command output.",
+    )
+    return ap
 
-    parser.add_argument("--subjects_dir", required=True,
-        help="Path to derivatives or subject data.")
-    parser.add_argument("--subject_id", required=True,
-        help="Subject identifier matching your derivatives naming.")
-    parser.add_argument("--space", choices=["T1", "MNI"], default="T1",
-        help="Output space: T1 (native) or MNI.")
-    parser.add_argument("--surf_type", choices=["pial","white","mid"], default="pial",
-        help="Which cortical surface to generate: pial, white, or mid (mid-thickness).")
-    parser.add_argument("--output_dir", default=".",
-        help="Where to store the output STL files (LH + RH + optional brainstem).")
-    parser.add_argument("--no_brainstem", action="store_true",
-        help="If set, skip extracting the brainstem.")
-    parser.add_argument("--no_fill", action="store_true",
-        help="If set, skip hole-filling in the extracted brainstem mesh.")
-    parser.add_argument("--no_smooth", action="store_true",
-        help="If set, skip Taubin smoothing in the extracted brainstem mesh.")
-    parser.add_argument("--split_hemis", action="store_true",
-        help="If set, export LH / RH / (optional) brainstem surfaces as separate files instead of merging.")
-    parser.add_argument("--out_warp", default="warp.nii",
-        help="(MNI only) Name of the 4D warp field to create, if needed.")
-    parser.add_argument("--no_clean", action="store_true",
-        help="If set, do NOT remove the temporary folder at the end.")
-    parser.add_argument("--verbose", action="store_true",
-        help="If set, prints additional progress messages.")
-    parser.add_argument("--run", default=None,
-        help="Run identifier, e.g. 'run-01' if your filenames include it.")
-    parser.add_argument("--session", default=None,
-        help="Session identifier, e.g. 'ses-01' if your filenames include it.")
 
-    args = parser.parse_args()
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+def _export_split(
+    lh: trimesh.Trimesh,
+    rh: trimesh.Trimesh,
+    bs: trimesh.Trimesh | None,
+    dest: Path,
+    subj: str,
+    space: str,
+    surf_type: str,
+    log_steps: list[str],
+    log_files: list[str],
+):
+    lh_out = dest / f"{subj}_{space}_{surf_type}_LH.stl"
+    rh_out = dest / f"{subj}_{space}_{surf_type}_RH.stl"
+    lh.export(lh_out, file_type="stl")
+    rh.export(rh_out, file_type="stl")
+    log_steps += [f"Exported LH ⇒ {lh_out}", f"Exported RH ⇒ {rh_out}"]
+    log_files += [str(lh_out), str(rh_out)]
 
-    do_clean = not args.no_clean
-    do_fill = not args.no_fill
-    do_smooth = not args.no_smooth
+    if bs:
+        bs_out = dest / f"{subj}_{space}_brainstem.stl"
+        bs.export(bs_out, file_type="stl")
+        log_steps.append(f"Exported brainstem ⇒ {bs_out}")
+        log_files.append(str(bs_out))
 
-    # Prepare a run log
-    log = {
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+def main() -> None:
+    args = _build_parser().parse_args()
+    log_level = logging.INFO if args.verbose else logging.WARNING
+    L = get_logger(__name__, level=log_level)
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---------------------------------------------------------------------- #
+    # External‑tool sanity checks (only needed for MNI warps)
+    # ---------------------------------------------------------------------- #
+    if args.space.upper() == "MNI":
+        require_cmds(
+            ["antsApplyTransforms", "warpinit", "mrcat"],
+            url_hint="Install ANTs & MRtrix3",
+            logger=L,
+        )
+
+    # ---------------------------------------------------------------------- #
+    # Structured run‑log dictionary
+    # ---------------------------------------------------------------------- #
+    runlog = {
         "tool": "brain_for_printing_cortical_surfaces",
         "subject_id": args.subject_id,
         "space": args.space,
         "surf_type": args.surf_type,
         "no_brainstem": args.no_brainstem,
         "split_hemis": args.split_hemis,
-        "output_dir": args.output_dir,
+        "output_dir": str(out_dir),
         "steps": [],
         "warnings": [],
-        "output_files": []
+        "output_files": [],
     }
 
-    # Create temporary folder for intermediate files
-    tmp_dir = os.path.join(args.output_dir, f"_tmp_cortical_{uuid.uuid4().hex[:6]}")
-    os.makedirs(tmp_dir, exist_ok=True)
-    if args.verbose:
-        print(f"[INFO] Temporary folder => {tmp_dir}")
-    log["steps"].append(f"Created temp dir => {tmp_dir}")
+    # ---------------------------------------------------------------------- #
+    # Work inside a managed temporary directory
+    # ---------------------------------------------------------------------- #
+    with temp_dir("cortical", keep=args.no_clean, base_dir=out_dir) as tmp_dir:
+        L.info("Temporary folder: %s", tmp_dir)
+        runlog["steps"].append(f"Created temp dir ⇒ {tmp_dir}")
 
-    # Call the new utility to generate LH/RH (plus optional brainstem).
-    # The user chooses pial, white, or mid via --surf_type.
-    surfaces_tuple = (args.surf_type,)
-    all_meshes = generate_brain_surfaces(
-        subjects_dir=args.subjects_dir,
-        subject_id=args.subject_id,
-        space=args.space,
-        surfaces=surfaces_tuple,
-        no_brainstem=args.no_brainstem,
-        no_fill=not do_fill,
-        no_smooth=not do_smooth,
-        out_warp=args.out_warp,
-        run=args.run,
-        session=args.session,
-        verbose=args.verbose,
-        tmp_dir=tmp_dir
-    )
-    log["steps"].append(f"Generated {args.surf_type} LH/RH surfaces in {args.space} space")
+        # ---------- generate surfaces ----------
+        meshes = generate_brain_surfaces(
+            subjects_dir=args.subjects_dir,
+            subject_id=args.subject_id,
+            space=args.space,
+            surfaces=(args.surf_type,),
+            no_brainstem=args.no_brainstem,
+            no_fill=args.no_fill,
+            no_smooth=args.no_smooth,
+            out_warp=args.out_warp,
+            run=args.run,
+            session=args.session,
+            verbose=args.verbose,
+            tmp_dir=tmp_dir,
+        )
+        runlog["steps"].append(f"Generated {args.surf_type} LH/RH in {args.space}")
 
-    lh_mesh = all_meshes[f"{args.surf_type}_L"]
-    rh_mesh = all_meshes[f"{args.surf_type}_R"]
-    bs_mesh = all_meshes["brainstem"]  # may be None if no_brainstem=True
+        lh_mesh = meshes[f"{args.surf_type}_L"]
+        rh_mesh = meshes[f"{args.surf_type}_R"]
+        bs_mesh = meshes["brainstem"]  # may be None
 
-    # Merge or split hemispheres
-    if not args.split_hemis:
-        # Combine LH + RH + optional brainstem
-        final_mesh = lh_mesh + rh_mesh
-        if bs_mesh:
-            final_mesh += bs_mesh
+        # ---------- export ----------
+        if args.split_hemis:
+            _export_split(
+                lh_mesh,
+                rh_mesh,
+                bs_mesh,
+                out_dir,
+                args.subject_id,
+                args.space,
+                args.surf_type,
+                runlog["steps"],
+                runlog["output_files"],
+            )
+        else:
+            combined: trimesh.Trimesh = lh_mesh + rh_mesh
+            if bs_mesh:
+                combined += bs_mesh
+            out_path = (
+                out_dir / f"{args.subject_id}_{args.space}_{args.surf_type}_brain.stl"
+            )
+            combined.export(out_path, file_type="stl")
+            runlog["steps"].append(f"Exported merged mesh ⇒ {out_path}")
+            runlog["output_files"].append(str(out_path))
 
-        out_stl = os.path.join(args.output_dir, f"{args.subject_id}_{args.space}_{args.surf_type}_brain.stl")
-        final_mesh.export(out_stl, file_type="stl")
-        log["steps"].append("Exported combined LH+RH (and possibly brainstem)")
-        log["output_files"].append(out_stl)
-    else:
-        # Export each hemisphere (and brainstem) separately
-        lh_out = os.path.join(args.output_dir, f"{args.subject_id}_{args.space}_{args.surf_type}_LH.stl")
-        rh_out = os.path.join(args.output_dir, f"{args.subject_id}_{args.space}_{args.surf_type}_RH.stl")
-        lh_mesh.export(lh_out, file_type="stl")
-        rh_mesh.export(rh_out, file_type="stl")
-        log["steps"].append(f"Exported LH => {lh_out}")
-        log["steps"].append(f"Exported RH => {rh_out}")
-        log["output_files"].extend([lh_out, rh_out])
+        if args.no_clean:
+            runlog["warnings"].append("Temp folder kept via --no_clean")
+        else:
+            runlog["steps"].append(f"Removed temp dir ⇒ {tmp_dir}")
 
-        if bs_mesh:
-            bs_out = os.path.join(args.output_dir, f"{args.subject_id}_{args.space}_brainstem.stl")
-            bs_mesh.export(bs_out, file_type="stl")
-            log["steps"].append(f"Exported brainstem => {bs_out}")
-            log["output_files"].append(bs_out)
-
-    # Write the JSON log
-    write_log(log, args.output_dir, base_name="cortical_surfaces_log")
-
-    # Cleanup the temp folder if requested
-    if do_clean:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        if args.verbose:
-            print(f"[INFO] Removed temporary folder => {tmp_dir}")
-        log["steps"].append(f"Removed temp dir => {tmp_dir}")
-    else:
-        if args.verbose:
-            print(f"[INFO] Temporary folder retained => {tmp_dir}")
+    # ---------------------------------------------------------------------- #
+    # Save JSON audit‑log
+    # ---------------------------------------------------------------------- #
+    write_log(runlog, out_dir, base_name="cortical_surfaces_log")
+    L.info("Done.")
 
 
 if __name__ == "__main__":
