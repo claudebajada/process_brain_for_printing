@@ -1,51 +1,120 @@
 # brain_for_printing/io_utils.py
 
+"""
+I/O and shell‑utility helpers used throughout the package.
+"""
+
+from __future__ import annotations
 import glob
 import os
-import subprocess
 import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import uuid
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Iterable, Optional
 
-def run_cmd(cmd, verbose=False):
+# --------------------------------------------------------------------- #
+# External‑process helpers
+# --------------------------------------------------------------------- #
+
+def run_cmd(cmd: list[str] | tuple[str, ...], verbose: bool = False) -> None:
     """
-    Run an external command as a subprocess.
-    If 'verbose' is True, the command and its output are shown.
-    Otherwise, all external messages are suppressed.
+    Execute *cmd* (a sequence) and raise with stderr attached if it fails.
+
+    If *verbose* is ``True`` stdout/stderr are shown live; otherwise only
+    captured stderr is printed on failure.
     """
-    if verbose:
-        print(f"[CMD] {' '.join(cmd)}")
-        subprocess.run(cmd, check=True)
+    try:
+        subprocess.run(
+            cmd,
+            check=True,
+            stdout=None if verbose else subprocess.DEVNULL,
+            stderr=None if verbose else subprocess.PIPE,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        err = exc.stderr or "<no stderr captured>"
+        raise RuntimeError(f"[CMD‑FAIL] {' '.join(cmd)}\n{err}") from None
+
+
+def require_cmd(cmd: str, url_hint: str | None = None, logger=None) -> Path:
+    """
+    Abort the program if *cmd* is not on the user’s ``$PATH``.
+    """
+    path = shutil.which(cmd)
+    if path:
+        return Path(path)
+
+    msg = f"Required external command not found: '{cmd}'."
+    if url_hint:
+        msg += f"  ({url_hint})"
+    if logger:
+        logger.error(msg)
     else:
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(msg, file=sys.stderr)
+    sys.exit(1)
 
 
-def first_match(pattern):
+def require_cmds(cmds: Iterable[str], url_hint: str | None = None, logger=None) -> dict[str, Path]:
+    """Check several commands at once."""
+    return {c: require_cmd(c, url_hint, logger) for c in cmds}
+
+
+# --------------------------------------------------------------------- #
+# Temporary‑directory helper
+# --------------------------------------------------------------------- #
+
+@contextmanager
+def temp_dir(tag: str = "bfp", keep: bool = False, base_dir: str | None = None):
     """
-    Return the first file that matches the given pattern.
-    If multiple matches are found, return the first but warn the user.
+    Context‑manager that yields a *Path* to a temporary directory
+    (wrapper around ``tempfile.TemporaryDirectory``).
+
+    If *keep* is True the folder is **not** deleted on exit (mirrors
+    ``--no_clean`` CLI flags).
     """
+    prefix = f"_{tag}_{uuid.uuid4().hex[:6]}_"
+    if keep:
+        path = Path(tempfile.mkdtemp(prefix=prefix, dir=base_dir))
+        try:
+            yield path
+        finally:
+            pass                     # caller keeps it
+    else:
+        with tempfile.TemporaryDirectory(prefix=prefix, dir=base_dir) as td:
+            yield Path(td)
+            # auto‑removed by TemporaryDirectory
+
+
+# --------------------------------------------------------------------- #
+# File‑matching helpers
+# --------------------------------------------------------------------- #
+
+def first_match(pattern: str) -> str:
     matches = glob.glob(pattern)
-    if len(matches) == 0:
+    if not matches:
         raise FileNotFoundError(f"No files found for pattern: {pattern}")
     if len(matches) > 1:
-        print(f"[WARNING] Multiple files found for {pattern}; using {matches[0]}")
+        print(f"[WARNING] Multiple files for {pattern}; using {matches[0]}")
     return matches[0]
 
-def flexible_match(base_dir, subject_id, descriptor, suffix, session=None, run=None, hemi=None, ext=".nii.gz"):
+
+def flexible_match(
+    base_dir: str | os.PathLike,
+    subject_id: str,
+    descriptor: str | None,
+    suffix: str | None,
+    session: str | None = None,
+    run: str | None = None,
+    hemi: str | None = None,
+    ext: str = ".nii.gz",
+) -> str:
     """
-    Flexibly match files following BIDS conventions.
-
-    Parameters:
-    - base_dir: base directory for files
-    - subject_id: subject identifier (e.g., sub-01)
-    - descriptor: BIDS descriptor (e.g., desc-aseg)
-    - suffix: file suffix (e.g., dseg)
-    - session: optional session identifier (e.g., ses-01)
-    - run: optional run identifier (e.g., run-01)
-    - hemi: optional hemisphere identifier (e.g., hemi-L)
-    - ext: file extension (default ".nii.gz")
-
-    Returns:
-    - First matched file path
+    Build a BIDS‑style glob pattern and return the first match.
     """
     pattern = f"{base_dir}/{subject_id}"
     if session:
@@ -61,19 +130,14 @@ def flexible_match(base_dir, subject_id, descriptor, suffix, session=None, run=N
         pattern += f"_{suffix}"
     pattern += ext
 
-    matches = sorted(glob.glob(pattern))
-    if len(matches) == 0:
-        raise FileNotFoundError(f"No files found for pattern: {pattern}")
-    if len(matches) > 1:
-        print(f"[WARNING] Multiple files found for {pattern}; using {matches[0]}")
-    return matches[0]
+    return first_match(pattern)
 
+
+# --------------------------------------------------------------------- #
+# nibabel convenience
+# --------------------------------------------------------------------- #
 
 def load_nifti(nifti_path):
-    """
-    Load NIfTI file and return data and affine.
-    """
     import nibabel as nib
     nii = nib.load(nifti_path)
     return nii.get_fdata(), nii.affine
-
