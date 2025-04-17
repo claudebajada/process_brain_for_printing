@@ -1,21 +1,18 @@
 [build-system]
-requires = ["setuptools", "wheel"]
+requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "brain_for_printing"
 version = "0.1.0"
-description = "Generate 3D-printable brain surfaces (pial + brainstem) in T1/MNI space"
+description = "Generate 3‑D printable brain surfaces in T1 or MNI space"
 readme = "README.md"
-requires-python = ">=3.7"
+requires-python = ">=3.8"
 license = {text = "MIT"}
 authors = [
-  { name="Claude J. Bajada", email="claude.bajada@um.edu.mt" }
+  {name = "Claude J. Bajada", email = "claude.bajada@um.edu.mt"}
 ]
-keywords = ["3D-printing", "Neuroimaging", "NIfTI", "Freesurfer", "Brain"]
-# Python version requirement (example: 3.7+):
-
-# Additional metadata (classifiers, etc.)
+keywords = ["3D‑printing", "Neuroimaging", "Freesurfer", "Brain"]
 classifiers = [
   "Programming Language :: Python :: 3",
   "License :: OSI Approved :: MIT License",
@@ -23,26 +20,43 @@ classifiers = [
   "Operating System :: MacOS"
 ]
 
-# Dependencies automatically installed by pip
+# -------------------------------------------------------------------- #
+# Core runtime dependencies.  They are intentionally kept minimal; all
+# heavy neuro‑tools (FreeSurfer, FSL, ANTs, MRtrix) are treated as
+# external binaries that the CLI checks for at runtime.
+# -------------------------------------------------------------------- #
 dependencies = [
   "numpy",
   "nibabel",
   "scipy",
-  "scikit-image",
+  "scikit-image",              # marching_cubes, morphology
   "trimesh",
-  "matplotlib"
+  "matplotlib",                # colourmaps for overlay utilities
+  "vtk>=9.0.0",                # needed for CLI combine‑structures
+]
+
+[project.optional-dependencies]
+# Install with  `pip install brain_for_printing[dev]`
+dev = [
+  "black",
+  "ruff",
+  "isort",
+  "pytest",
+  "pytest-cov",
 ]
 
 [project.scripts]
-# CLI entry points:
-brain_for_printing_brainstem = "brain_for_printing.cli_brainstem:main"
-brain_for_printing_color = "brain_for_printing.cli_color:main"
-brain_for_printing_slab_slices = "brain_for_printing.cli_slab_slices:main"
-brain_for_printing_hollow_ventricles = "brain_for_printing.cli_hollow_ventricles:main"
-brain_for_printing_overlay = "brain_for_printing.cli_overlay:main"
-brain_for_printing_brain_mask_surface = "brain_for_printing.cli_brain_mask_surface:main"
-brain_for_printing_cortical_surfaces = "brain_for_printing.cli_cortical_surfaces:main"
-brain_for_printing_combine_structures = "brain_for_printing.cli_combine_structures:main"
+brain_for_printing_cortical_surfaces   = "brain_for_printing.cli_cortical_surfaces:main"
+brain_for_printing_brainstem           = "brain_for_printing.cli_brainstem:main"
+brain_for_printing_color               = "brain_for_printing.cli_color:main"
+brain_for_printing_slab_slices         = "brain_for_printing.cli_slab_slices:main"
+brain_for_printing_hollow_ventricles   = "brain_for_printing.cli_hollow_ventricles:main"
+brain_for_printing_brain_mask_surface  = "brain_for_printing.cli_brain_mask_surface:main"
+brain_for_printing_combine_structures  = "brain_for_printing.cli_combine_structures:main"
 
 [tool.setuptools]
 packages = ["brain_for_printing"]
+
+[tool.setuptools.package-data]
+# Include any template GIFTIs or sample data placed under the package.
+"brain_for_printing" = ["data/**/*"]
