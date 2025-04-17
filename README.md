@@ -13,7 +13,6 @@ The core is pure‑Python (`trimesh`, `nibabel`, `scikit‑image`) while heavy l
 | **Surface extraction** | • LH/RH pial, white, **or** mid surfaces in T1 or warped MNI.<br>• Optional brainstem extraction with hole‑fill & smoothing.<br>• Automatic ANTs→MRtrix 4‑D warp generation. |
 | **Colouring** | • Sample NIfTI param maps per‑vertex.<br>• Thresholding & discrete colour bins.<br>• Works on existing STL/OBJ/GIFTI **or** freshly generated surfaces. |
 | **Mesh ops** | • Voxel remesh + repair helper.<br>• Ventricular hollowing via boolean difference.<br>• Slab slicing with per‑slab bounding‑box padding. |
-| **CLI ergonomics** | • One‑line temp‑dir management (`--no_clean` to keep).<br>• Unified `‑v/‑‑verbose`, structured logs, and clear external‑tool checks. |
 
 ---
 
