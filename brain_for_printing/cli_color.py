@@ -191,22 +191,25 @@ def _run_surface(args, logger) -> None:
         # ---------- export ----------
         if not args.split_hemis:
             merged = lh + rh + (bs if bs else trimesh.Trimesh())
-            out_stl = out_dir / f"{args.subject_id}_{args.space}_{args.surf_type}_brain_colored.stl"
-            merged.export(out_stl, file_type="stl")
-            runlog["output_files"].append(str(out_stl))
-            runlog["steps"].append(f"Exported merged ⇒ {out_stl}")
+            out_obj = out_dir / f"{args.subject_id}_{args.space}_{args.surf_type}_brain_colored.obj"
+            merged.export(out_obj, file_type="obj")
+            runlog["output_files"].append(str(out_obj))
+            runlog["steps"].append(f"Exported merged ⇒ {out_obj}") # Update log message
+
         else:
-            lh_out = out_dir / f"{args.subject_id}_{args.space}_{args.surf_type}_LH_colored.stl"
-            rh_out = out_dir / f"{args.subject_id}_{args.space}_{args.surf_type}_RH_colored.stl"
-            lh.export(lh_out, file_type="stl")
-            rh.export(rh_out, file_type="stl")
+            lh_out = out_dir / f"{args.subject_id}_{args.space}_{args.surf_type}_LH_colored.obj"
+            rh_out = out_dir / f"{args.subject_id}_{args.space}_{args.surf_type}_RH_colored.obj"
+            lh.export(lh_out, file_type="obj")
+            rh.export(rh_out, file_type="obj")
             runlog["output_files"] += [str(lh_out), str(rh_out)]
             runlog["steps"] += [f"Exported LH ⇒ {lh_out}", f"Exported RH ⇒ {rh_out}"]
 
             if bs:
-                bs_out = out_dir / f"{args.subject_id}_{args.space}_brainstem_colored.stl"
-                bs.export(bs_out, file_type="stl")
+                # Change filename extension and file_type for brainstem
+                bs_out = out_dir / f"{args.subject_id}_{args.space}_brainstem_colored.obj"
+                bs.export(bs_out, file_type="obj")
                 runlog["output_files"].append(str(bs_out))
+                # Update log message
                 runlog["steps"].append(f"Exported brainstem ⇒ {bs_out}")
 
     write_log(runlog, out_dir, base_name="color_surface_log")
