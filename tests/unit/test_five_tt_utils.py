@@ -6,12 +6,26 @@ from pathlib import Path
 import logging
 import trimesh
 import numpy as np
+from unittest.mock import patch
 
 from brain_for_printing.five_tt_utils import (
     _read_vtk_polydata,
     _vtk_polydata_to_trimesh,
-    load_subcortical_and_ventricle_meshes
+    load_subcortical_and_ventricle_meshes,
+    is_vtk_available
 )
+
+@pytest.fixture
+def mock_vtk_available():
+    """Mock VTK as available."""
+    with patch('brain_for_printing.five_tt_utils.is_vtk_available', return_value=True):
+        yield
+
+@pytest.fixture
+def mock_vtk_unavailable():
+    """Mock VTK as unavailable."""
+    with patch('brain_for_printing.five_tt_utils.is_vtk_available', return_value=False):
+        yield
 
 def test_read_vtk_polydata_with_vtk_available(sample_vtk_file, mock_vtk_available):
     """Test reading VTK file when VTK is available."""
@@ -37,7 +51,8 @@ def test_vtk_polydata_to_trimesh_with_vtk_available(sample_vtk_file, mock_vtk_av
     assert mesh is not None
     assert isinstance(mesh, trimesh.Trimesh)
     assert len(mesh.vertices) == 8  # Cube has 8 vertices
-    assert len(mesh.faces) == 6  # Cube has 6 faces
+    # Each quad face is triangulated into 2 triangles, so 6 quads = 12 triangles
+    assert len(mesh.faces) == 12  # Cube has 6 faces, each triangulated
 
 def test_vtk_polydata_to_trimesh_with_vtk_unavailable(mock_vtk_unavailable):
     """Test converting VTK polydata to trimesh when VTK is unavailable."""

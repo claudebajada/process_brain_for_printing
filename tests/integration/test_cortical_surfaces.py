@@ -6,11 +6,9 @@ from pathlib import Path
 import logging
 import shutil
 import os
+import trimesh
 
-from brain_for_printing.cortical_surfaces import (
-    generate_cortical_surfaces,
-    save_surfaces_to_stl
-)
+from brain_for_printing.surfgen_utils import generate_brain_surfaces
 
 def test_generate_cortical_surfaces_basic(temp_dir, mock_vtk_available):
     """Test basic cortical surface generation workflow."""
@@ -18,59 +16,50 @@ def test_generate_cortical_surfaces_basic(temp_dir, mock_vtk_available):
     subjects_dir = temp_dir / "subjects"
     subject_id = "test_subject"
     subject_dir = subjects_dir / subject_id
+    anat_dir = subject_dir / "anat"
     
     # Create minimal required FreeSurfer files
-    os.makedirs(subject_dir / "surf", exist_ok=True)
-    os.makedirs(subject_dir / "mri", exist_ok=True)
+    os.makedirs(anat_dir, exist_ok=True)
     
     # Create mock surface files
-    with open(subject_dir / "surf" / "lh.white", "w") as f:
-        f.write("mock surface data")
-    with open(subject_dir / "surf" / "rh.white", "w") as f:
-        f.write("mock surface data")
+    lh_pial = anat_dir / f"{subject_id}_hemi-L_pial.surf.gii"
+    rh_pial = anat_dir / f"{subject_id}_hemi-R_pial.surf.gii"
+    
+    # Create simple GIFTI files
+    for surf_file in [lh_pial, rh_pial]:
+        with open(surf_file, "w") as f:
+            f.write("mock surface data")
     
     # Test surface generation
-    surfaces = generate_cortical_surfaces(
+    surfaces = generate_brain_surfaces(
         subjects_dir=str(subjects_dir),
         subject_id=subject_id,
-        surfaces=["white"],
-        hemispheres=["lh", "rh"]
+        space="T1",
+        surfaces=["pial"],
+        tmp_dir=str(temp_dir / "work")
     )
     
     assert surfaces is not None
-    assert len(surfaces) == 2  # One for each hemisphere
-    assert all(k in surfaces for k in ["lh.white", "rh.white"])
+    assert isinstance(surfaces, dict)
+    assert "pial_L" in surfaces
+    assert "pial_R" in surfaces
 
-def test_save_surfaces_to_stl(temp_dir, mock_vtk_available):
-    """Test saving surfaces to STL files."""
-    # Create mock surfaces dictionary
-    surfaces = {
-        "lh.white": None,  # In real test, this would be a trimesh object
-        "rh.white": None
-    }
-    
-    output_dir = temp_dir / "output"
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Test saving surfaces
-    save_surfaces_to_stl(surfaces, str(output_dir))
-    
-    # Check that output directory exists
-    assert output_dir.exists()
-    
-    # In a real test with actual mesh objects, we would check for the STL files
-    # assert (output_dir / "lh.white.stl").exists()
-    # assert (output_dir / "rh.white.stl").exists()
+def test_generate_cortical_surfaces_invalid_space(temp_dir, mock_vtk_available):
+    """Test surface generation with invalid space."""
+    with pytest.raises(ValueError, match="Invalid space"):
+        generate_brain_surfaces(
+            subjects_dir=str(temp_dir),
+            subject_id="test_subject",
+            space="invalid_space",
+            surfaces=["pial"]
+        )
 
-def test_generate_cortical_surfaces_invalid_subject(temp_dir, mock_vtk_available):
-    """Test surface generation with invalid subject directory."""
-    subjects_dir = temp_dir / "subjects"
-    subject_id = "nonexistent_subject"
-    
-    with pytest.raises(FileNotFoundError):
-        generate_cortical_surfaces(
-            subjects_dir=str(subjects_dir),
-            subject_id=subject_id,
-            surfaces=["white"],
-            hemispheres=["lh", "rh"]
+def test_generate_cortical_surfaces_inflated_non_t1(temp_dir, mock_vtk_available):
+    """Test that inflated surfaces are only allowed in T1 space."""
+    with pytest.raises(ValueError, match="Inflated surf only T1 space"):
+        generate_brain_surfaces(
+            subjects_dir=str(temp_dir),
+            subject_id="test_subject",
+            space="MNI",
+            surfaces=["inflated"]
         ) 

@@ -17,125 +17,127 @@ import nibabel as nib
 import numpy as np
 
 # Handle Optional VTK Import
+VTK_AVAILABLE = False
 try:
     from vtk.util import numpy_support # type: ignore
     import vtk                     # type: ignore
     VTK_AVAILABLE = True
 except ImportError:
-    VTK_AVAILABLE = False
+    pass
 
 L = logging.getLogger(__name__)
 
+def is_vtk_available() -> bool:
+    """Check if VTK is available."""
+    return VTK_AVAILABLE
+
 # VTK Helper Functions
-if VTK_AVAILABLE:
-    def _read_vtk_polydata(path: str, logger: logging.Logger) -> Optional[vtk.vtkPolyData]:
-        """
-        Read VTK polydata from file using various reader types.
+def _read_vtk_polydata(path: str, logger: logging.Logger) -> Optional[object]:
+    """
+    Read VTK polydata from file using various reader types.
+    
+    Args:
+        path: Path to VTK file
+        logger: Logger instance
         
-        Args:
-            path: Path to VTK file
-            logger: Logger instance
-            
-        Returns:
-            Optional[vtk.vtkPolyData]: VTK polydata object if successful, None otherwise
-        """
-        logger.debug(f"Reading VTK: {path}")
-        if not Path(path).exists():
-            logger.error(f"VTK file not found: {path}")
-            return None
-
-        reader_types = [
-            vtk.vtkSTLReader,
-            vtk.vtkPolyDataReader,
-            vtk.vtkXMLPolyDataReader,
-            vtk.vtkGenericDataObjectReader
-        ]
-
-        for reader_class in reader_types:
-            try:
-                reader = reader_class()
-                reader.SetFileName(path)
-                reader.Update()
-
-                poly_data_output = None
-                if isinstance(reader, vtk.vtkGenericDataObjectReader):
-                    if reader.IsFilePolyData():
-                        poly_data_output = reader.GetPolyDataOutput()
-                    else:
-                        logger.debug(f"vtkGeneric reports {path} not PolyData.")
-                        continue
-                elif hasattr(reader, 'GetOutput') and isinstance(reader.GetOutput(), vtk.vtkPolyData):
-                    poly_data_output = reader.GetOutput()
-
-                if poly_data_output and poly_data_output.GetNumberOfPoints() > 0:
-                    logger.info(f"Read {Path(path).name} via {reader_class.__name__}.")
-                    return poly_data_output
-                else:
-                    logger.debug(f"{reader_class.__name__} gave no/empty PolyData for {path}.")
-            except Exception as e_reader:
-                logger.debug(f"{reader_class.__name__} failed for {path}: {e_reader}")
-
-        logger.warning(f"Could not read valid PolyData from VTK file {path}.")
-        return None
-
-    def _vtk_polydata_to_trimesh(poly_data: Optional[vtk.vtkPolyData]) -> Optional[trimesh.Trimesh]:
-        """
-        Convert VTK polydata to trimesh object.
-        
-        Args:
-            poly_data: VTK polydata object
-            
-        Returns:
-            Optional[trimesh.Trimesh]: Trimesh object if successful, None otherwise
-        """
-        if not VTK_AVAILABLE or poly_data is None or poly_data.GetNumberOfPoints() == 0:
-            return None
-
-        num_pts = poly_data.GetPoints().GetNumberOfPoints()
-        verts = np.zeros((num_pts, 3))
-        for i in range(num_pts):
-            verts[i, :] = poly_data.GetPoints().GetPoint(i)
-
-        faces = []
-        ids = vtk.vtkIdList()
-        polys = poly_data.GetPolys()
-
-        if polys and polys.GetNumberOfCells() > 0:
-            polys.InitTraversal()
-            while polys.GetNextCell(ids):
-                faces.append([ids.GetId(j) for j in range(ids.GetNumberOfIds())])
-        elif poly_data.GetStrips() and poly_data.GetStrips().GetNumberOfCells() > 0:
-            strips = poly_data.GetStrips()
-            strips.InitTraversal()
-            L.warning("VTK has strips, may be lossy.")
-            while strips.GetNextCell(ids):
-                for j in range(ids.GetNumberOfIds() - 2):
-                    faces.append([
-                        ids.GetId(j + (j % 2)),
-                        ids.GetId(j + 1 - (j % 2)),
-                        ids.GetId(j + 2)
-                    ])
-
-        if not faces:
-            L.warning("VTK has points but no faces.")
-            return trimesh.Trimesh(vertices=verts)
-
-        try:
-            mesh = trimesh.Trimesh(vertices=verts, faces=np.array(faces), process=True)
-            return None if mesh.is_empty else mesh
-        except Exception as e:
-            L.error(f"Failed Trimesh creation: {e}")
-            return None
-else:
-    def _read_vtk_polydata(path: str, logger: logging.Logger) -> Optional[object]:
-        """Stub for when VTK is not available."""
+    Returns:
+        Optional[vtk.vtkPolyData]: VTK polydata object if successful, None otherwise
+    """
+    if not is_vtk_available():
         logger.error(f"VTK unavailable, cannot read: {path}")
         return None
 
-    def _vtk_polydata_to_trimesh(poly: Optional[object]) -> Optional[trimesh.Trimesh]:
-        """Stub for when VTK is not available."""
-        log_func = L.error if 'L' in globals() else print
-        log_func("VTK unavailable.")
+    logger.debug(f"Reading VTK: {path}")
+    if not Path(path).exists():
+        logger.error(f"VTK file not found: {path}")
+        return None
+
+    reader_types = [
+        vtk.vtkSTLReader,
+        vtk.vtkPolyDataReader,
+        vtk.vtkXMLPolyDataReader,
+        vtk.vtkGenericDataObjectReader
+    ]
+
+    for reader_class in reader_types:
+        try:
+            reader = reader_class()
+            reader.SetFileName(path)
+            reader.Update()
+
+            poly_data_output = None
+            if isinstance(reader, vtk.vtkGenericDataObjectReader):
+                if reader.IsFilePolyData():
+                    poly_data_output = reader.GetPolyDataOutput()
+                else:
+                    logger.debug(f"vtkGeneric reports {path} not PolyData.")
+                    continue
+            elif hasattr(reader, 'GetOutput') and isinstance(reader.GetOutput(), vtk.vtkPolyData):
+                poly_data_output = reader.GetOutput()
+
+            if poly_data_output and poly_data_output.GetNumberOfPoints() > 0:
+                logger.info(f"Read {Path(path).name} via {reader_class.__name__}.")
+                return poly_data_output
+            else:
+                logger.debug(f"{reader_class.__name__} gave no/empty PolyData for {path}.")
+        except Exception as e_reader:
+            logger.debug(f"{reader_class.__name__} failed for {path}: {e_reader}")
+
+    logger.warning(f"Could not read valid PolyData from VTK file {path}.")
+    return None
+
+def _vtk_polydata_to_trimesh(poly_data: Optional[object]) -> Optional[trimesh.Trimesh]:
+    """
+    Convert VTK polydata to trimesh object.
+    
+    Args:
+        poly_data: VTK polydata object
+        
+    Returns:
+        Optional[trimesh.Trimesh]: Trimesh object if successful, None otherwise
+    """
+    if not is_vtk_available() or poly_data is None:
+        L.error("VTK unavailable or no polydata provided.")
+        return None
+
+    if not isinstance(poly_data, vtk.vtkPolyData) or poly_data.GetNumberOfPoints() == 0:
+        L.error("Invalid polydata object.")
+        return None
+
+    num_pts = poly_data.GetPoints().GetNumberOfPoints()
+    verts = np.zeros((num_pts, 3))
+    for i in range(num_pts):
+        verts[i, :] = poly_data.GetPoints().GetPoint(i)
+
+    faces = []
+    ids = vtk.vtkIdList()
+    polys = poly_data.GetPolys()
+
+    if polys and polys.GetNumberOfCells() > 0:
+        polys.InitTraversal()
+        while polys.GetNextCell(ids):
+            faces.append([ids.GetId(j) for j in range(ids.GetNumberOfIds())])
+    elif poly_data.GetStrips() and poly_data.GetStrips().GetNumberOfCells() > 0:
+        strips = poly_data.GetStrips()
+        strips.InitTraversal()
+        L.warning("VTK has strips, may be lossy.")
+        while strips.GetNextCell(ids):
+            for j in range(ids.GetNumberOfIds() - 2):
+                faces.append([
+                    ids.GetId(j + (j % 2)),
+                    ids.GetId(j + 1 - (j % 2)),
+                    ids.GetId(j + 2)
+                ])
+
+    if not faces:
+        L.warning("VTK has points but no faces.")
+        return trimesh.Trimesh(vertices=verts)
+
+    try:
+        mesh = trimesh.Trimesh(vertices=verts, faces=np.array(faces), process=True)
+        return None if mesh.is_empty else mesh
+    except Exception as e:
+        L.error(f"Failed Trimesh creation: {e}")
         return None
 
 def run_5ttgen_hsvs_save_temp_bids(
