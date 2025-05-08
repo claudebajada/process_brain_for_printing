@@ -11,7 +11,7 @@ import subprocess
 import json
 import glob
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Union
 import trimesh
 import nibabel as nib
 import numpy as np
@@ -26,13 +26,114 @@ except ImportError:
 
 L = logging.getLogger(__name__)
 
-# Define stubs if VTK not available
-if not VTK_AVAILABLE:
+# VTK Helper Functions
+if VTK_AVAILABLE:
+    def _read_vtk_polydata(path: str, logger: logging.Logger) -> Optional[vtk.vtkPolyData]:
+        """
+        Read VTK polydata from file using various reader types.
+        
+        Args:
+            path: Path to VTK file
+            logger: Logger instance
+            
+        Returns:
+            Optional[vtk.vtkPolyData]: VTK polydata object if successful, None otherwise
+        """
+        logger.debug(f"Reading VTK: {path}")
+        if not Path(path).exists():
+            logger.error(f"VTK file not found: {path}")
+            return None
+
+        reader_types = [
+            vtk.vtkSTLReader,
+            vtk.vtkPolyDataReader,
+            vtk.vtkXMLPolyDataReader,
+            vtk.vtkGenericDataObjectReader
+        ]
+
+        for reader_class in reader_types:
+            try:
+                reader = reader_class()
+                reader.SetFileName(path)
+                reader.Update()
+
+                poly_data_output = None
+                if isinstance(reader, vtk.vtkGenericDataObjectReader):
+                    if reader.IsFilePolyData():
+                        poly_data_output = reader.GetPolyDataOutput()
+                    else:
+                        logger.debug(f"vtkGeneric reports {path} not PolyData.")
+                        continue
+                elif hasattr(reader, 'GetOutput') and isinstance(reader.GetOutput(), vtk.vtkPolyData):
+                    poly_data_output = reader.GetOutput()
+
+                if poly_data_output and poly_data_output.GetNumberOfPoints() > 0:
+                    logger.info(f"Read {Path(path).name} via {reader_class.__name__}.")
+                    return poly_data_output
+                else:
+                    logger.debug(f"{reader_class.__name__} gave no/empty PolyData for {path}.")
+            except Exception as e_reader:
+                logger.debug(f"{reader_class.__name__} failed for {path}: {e_reader}")
+
+        logger.warning(f"Could not read valid PolyData from VTK file {path}.")
+        return None
+
+    def _vtk_polydata_to_trimesh(poly_data: Optional[vtk.vtkPolyData]) -> Optional[trimesh.Trimesh]:
+        """
+        Convert VTK polydata to trimesh object.
+        
+        Args:
+            poly_data: VTK polydata object
+            
+        Returns:
+            Optional[trimesh.Trimesh]: Trimesh object if successful, None otherwise
+        """
+        if not VTK_AVAILABLE or poly_data is None or poly_data.GetNumberOfPoints() == 0:
+            return None
+
+        num_pts = poly_data.GetPoints().GetNumberOfPoints()
+        verts = np.zeros((num_pts, 3))
+        for i in range(num_pts):
+            verts[i, :] = poly_data.GetPoints().GetPoint(i)
+
+        faces = []
+        ids = vtk.vtkIdList()
+        polys = poly_data.GetPolys()
+
+        if polys and polys.GetNumberOfCells() > 0:
+            polys.InitTraversal()
+            while polys.GetNextCell(ids):
+                faces.append([ids.GetId(j) for j in range(ids.GetNumberOfIds())])
+        elif poly_data.GetStrips() and poly_data.GetStrips().GetNumberOfCells() > 0:
+            strips = poly_data.GetStrips()
+            strips.InitTraversal()
+            L.warning("VTK has strips, may be lossy.")
+            while strips.GetNextCell(ids):
+                for j in range(ids.GetNumberOfIds() - 2):
+                    faces.append([
+                        ids.GetId(j + (j % 2)),
+                        ids.GetId(j + 1 - (j % 2)),
+                        ids.GetId(j + 2)
+                    ])
+
+        if not faces:
+            L.warning("VTK has points but no faces.")
+            return trimesh.Trimesh(vertices=verts)
+
+        try:
+            mesh = trimesh.Trimesh(vertices=verts, faces=np.array(faces), process=True)
+            return None if mesh.is_empty else mesh
+        except Exception as e:
+            L.error(f"Failed Trimesh creation: {e}")
+            return None
+else:
     def _read_vtk_polydata(path: str, logger: logging.Logger) -> Optional[object]:
+        """Stub for when VTK is not available."""
         logger.error(f"VTK unavailable, cannot read: {path}")
         return None
-        
+
     def _vtk_polydata_to_trimesh(poly: Optional[object]) -> Optional[trimesh.Trimesh]:
+        """Stub for when VTK is not available."""
         log_func = L.error if 'L' in globals() else print
         log_func("VTK unavailable.")
         return None
@@ -189,49 +290,4 @@ def load_subcortical_and_ventricle_meshes(five_ttgen_persistent_dir_str: str) ->
                 L.error(f"Failed to load ventricle mesh {mesh_path}: {e}")
                 continue
             
-    return result
-
-if VTK_AVAILABLE:
-    def _read_vtk_polydata(path: str, logger: logging.Logger) -> Optional[vtk.vtkPolyData]:
-        """
-        Read a VTK polydata file.
-        
-        Args:
-            path: Path to VTK file
-            logger: Logger instance
-            
-        Returns:
-            Optional[vtk.vtkPolyData]: VTK polydata object if successful, None otherwise
-        """
-        try:
-            reader = vtk.vtkPolyDataReader()
-            reader.SetFileName(path)
-            reader.Update()
-            return reader.GetOutput()
-        except Exception as e:
-            logger.error(f"Failed to read VTK file {path}: {e}")
-            return None
-            
-    def _vtk_polydata_to_trimesh(poly_data: Optional[vtk.vtkPolyData]) -> Optional[trimesh.Trimesh]:
-        """
-        Convert VTK polydata to trimesh.
-        
-        Args:
-            poly_data: VTK polydata object
-            
-        Returns:
-            Optional[trimesh.Trimesh]: Trimesh object if successful, None otherwise
-        """
-        if poly_data is None:
-            return None
-            
-        try:
-            # Get points and faces
-            points = numpy_support.vtk_to_numpy(poly_data.GetPoints().GetData())
-            faces = numpy_support.vtk_to_numpy(poly_data.GetPolys().GetData()).reshape(-1, 4)[:, 1:]
-            
-            # Create trimesh
-            return trimesh.Trimesh(vertices=points, faces=faces)
-        except Exception as e:
-            L.error(f"Failed to convert VTK to trimesh: {e}")
-            return None 
+    return result 
