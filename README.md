@@ -1,6 +1,6 @@
 # Brain For Printing
 
-Generate **3 D‑printable brain surfaces** (cortical + optional brainstem) in T1, MNI, or target subject space, colour them from parametric volumes, slice them into stackable slabs, or hollow the ventricular system – all from the command line.
+Generate **3 D‑printable brain surfaces** (cortical + optional brainstem) in T1, MNI, or target subject space, colour them from parametric volumes, or slice them into stackable slabs – all from the command line.
 
 The core is pure‑Python (`trimesh`, `nibabel`, `scikit‑image`) while heavy lifting is delegated to familiar neuro‑tools (FreeSurfer, FSL, ANTs, MRtrix3).  Every CLI writes a timestamped JSON *run‑log* for provenance and supports structured console logging via `‑v/‑‑verbose`.
 
@@ -12,7 +12,7 @@ The core is pure‑Python (`trimesh`, `nibabel`, `scikit‑image`) while heavy l
 |------|------------|
 | **Surface extraction** | • LH/RH pial, white, **or** mid surfaces in T1, MNI, or target subject space.<br>• Optional brainstem extraction with hole‑fill & smoothing.<br>• Automatic ANTs→MRtrix 4‑D warp generation.<br>• Subject-to-subject warping support. |
 | **Colouring** | • Sample NIfTI param maps per‑vertex in source or target space.<br>• Thresholding & discrete colour bins.<br>• Works on existing STL/OBJ/GIFTI **or** freshly generated surfaces.<br>• Flexible sampling surface selection (white, pial, mid). |
-| **Mesh ops** | • Voxel remesh + repair helper.<br>• Ventricular hollowing via boolean difference.<br>• Slab slicing with per‑slab bounding‑box padding. |
+| **Mesh ops** | • Voxel remesh + repair helper.<br>• Slab slicing with per‑slab bounding‑box padding. |
 
 ---
 
@@ -51,13 +51,10 @@ CLIs abort early with a helpful message if a required binary is missing.
 
 | Command | Purpose |
 |---------|---------|
-| `brain_for_printing_cortical_surfaces` | Extract LH/RH cortical surfaces (+ brainstem) as STL. |
-| `brain_for_printing_brainstem` | Brainstem‑only STL. |
-| `brain_for_printing_color` | **direct** or **surface** colouring modes. |
+| `brain_for_printing_cortical_surfaces` | Extract LH/RH cortical surfaces (+ optional brainstem) as STL. |
+| `brain_for_printing_color` | **direct** or **preset** colouring modes. |
 | `brain_for_printing_slab_slices` | Slice one or more meshes into aligned slabs. |
-| `brain_for_printing_hollow_ventricles` | Subtract ventricles from a brain mesh. |
 | `brain_for_printing_brain_mask_surface` | Mesh a binary brain mask. |
-| `brain_for_printing_combine_structures` | Merge sub‑cortical + ventricular meshes. |
 
 Run any command with `‑h/‑‑help` for full argument reference.
 
@@ -139,18 +136,6 @@ brain_for_printing_slab_slices \
   --out_dir slabs_out
 ```
 
-### 5  Hollow ventricles
-
-```bash
-brain_for_printing_hollow_ventricles \
-  --subjects_dir /derivatives \
-  --subject_id sub‑01 \
-  --in_mesh sub‑01_T1_brain.stl \
-  --output sub‑01_T1_brain_hollow.stl \
-  --dilate_mask \
-  -v
-```
-
 ---
 
 ## Logging & reproducibility
@@ -164,6 +149,7 @@ brain_for_printing_hollow_ventricles \
 ## Roadmap
 
 * **Unit tests** – pytest suite with tiny dummy meshes (planned).
+* **Boolean operations** – General mesh boolean operations (planned).
 
 ---
 
