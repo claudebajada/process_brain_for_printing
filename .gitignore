@@ -38,3 +38,8 @@ venv/
 # Jupyter Notebook
 .ipynb_checkpoints/
 
+# Coverage files
+.coverage
+htmlcov/
+.pytest_cache/
+
