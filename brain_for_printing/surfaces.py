@@ -4,7 +4,7 @@
 surfaces.py
 -----------
 Generate multiple brain surfaces (cortical + optional brainstem, cerebellum, etc.)
-in T1 or MNI space based on FreeSurfer aseg labels. Includes function to run
+in T1, MNI, or target subject space. Includes function to run
 5ttgen hsvs and manage its working directory.
 """
 import os
@@ -15,692 +15,345 @@ import logging
 import subprocess
 import tempfile
 import json
-import glob # Added for globbing in load_subcortical_and_ventricle_meshes
+import glob
 from pathlib import Path
-# Corrected typing imports for older Python versions
 from typing import List, Tuple, Dict, Optional, Union
+import sys # Keep Added Import
 
-# Assuming these local imports are correct relative to surfaces.py
+# Import corrected flexible_match
 from .io_utils import run_cmd, flexible_match, first_match
 from .mesh_utils import volume_to_gifti, gifti_to_trimesh
-from .warp_utils import generate_mrtrix_style_warp, warp_gifti_vertices
+from .warp_utils import create_mrtrix_warp, warp_gifti_vertices
 from . import constants as const
+import numpy as np
+import nibabel as nib
 
+# Handle Optional VTK Import
+try:
+    from vtk.util import numpy_support # type: ignore
+    import vtk                     # type: ignore
+    VTK_AVAILABLE = True
+except ImportError:
+    VTK_AVAILABLE = False
 
-# Configure logger for this module
-L = logging.getLogger(__name__) # Define logger once for the module
+L = logging.getLogger(__name__)
 
-# --- Helper Function for T1 Mask Extraction ---
+# Define stubs if VTK not available *before* they are potentially used
+if not VTK_AVAILABLE:
+    def _read_vtk_polydata(path: str, logger: logging.Logger) -> Optional[object]:
+        logger.error(f"VTK unavailable, cannot read: {path}"); return None
+    def _vtk_polydata_to_trimesh(poly: Optional[object]) -> Optional[trimesh.Trimesh]:
+        log_func = L.error if 'L' in globals() else print; log_func("VTK unavailable."); return None
 
-def _extract_structure_mask_t1(
-    aseg_t1_nii: str,
-    label_ids: List[int],
-    output_mask_nii: str,
-    tmp_dir: str = ".",
-    verbose: bool = False
-) -> bool:
-    """
-    Helper to binarize a T1-space aseg NIfTI based on label IDs.
-
-    Args:
-        aseg_t1_nii (str): Path to the input aseg NIfTI file in T1 space.
-        label_ids (List[int]): List of integer label IDs to match.
-        output_mask_nii (str): Path for the output binary mask NIfTI file.
-        tmp_dir (str): Temporary directory for intermediate files.
-        verbose (bool): Verbosity flag.
-
-    Returns:
-        bool: True if successful, False otherwise.
-    """
-    if not Path(aseg_t1_nii).exists():
-        L.error(f"Input aseg file not found: {aseg_t1_nii}")
-        return False
-
-    match_str = [str(lbl) for lbl in label_ids]
-    L.info(f"Extracting labels {match_str} from {Path(aseg_t1_nii).name}")
-
-    try:
-        # Direct binarization using mri_binarize
-        run_cmd([
-            "mri_binarize",
-            "--i", aseg_t1_nii,
-            "--match", *match_str,  # Unpack the list of strings
-            "--o", output_mask_nii
-        ], verbose=verbose)
-        # Optional: Ensure pure binary mask if needed
-        # run_cmd(["fslmaths", output_mask_nii, "-bin", output_mask_nii], verbose=verbose)
-
-    except Exception as e:
-        L.error(f"Failed to binarize {aseg_t1_nii} for labels {match_str}: {e}")
-        # Clean up potentially incomplete output file
-        if Path(output_mask_nii).exists():
-            try:
-                os.remove(output_mask_nii)
-            except OSError:
-                pass # Ignore if removal fails
-        return False
-
-    if not Path(output_mask_nii).exists() or Path(output_mask_nii).stat().st_size == 0:
-        L.error(f"Binary mask {output_mask_nii} was not created or is empty.")
-        return False
-
+# --- Mask Extraction Helper ---
+def _extract_structure_mask_t1( aseg_nifti_path: str, label_ids: List[int], output_mask_nifti_path: str, verbose: bool = False ):
+    if not Path(aseg_nifti_path).exists(): L.error(f"Input NIfTI not found: {aseg_nifti_path}"); return False
+    match_str = [str(lbl) for lbl in label_ids]; L.info(f"Extracting {match_str} from {Path(aseg_nifti_path).name} -> {Path(output_mask_nifti_path).name}")
+    try: run_cmd(["mri_binarize", "--i", aseg_nifti_path, "--match", *match_str, "--o", output_mask_nifti_path], verbose=verbose)
+    except Exception as e: L.error(f"mri_binarize failed: {e}", exc_info=verbose); return False
+    output_path = Path(output_mask_nifti_path)
+    if not output_path.exists() or output_path.stat().st_size == 0: L.error(f"Output mask empty/not created: {output_path.name}"); return False
     return True
 
-# --- Main Structure Extraction Function (T1 and MNI) ---
-
-def extract_structure_surface(
-    subjects_dir: str,
-    subject_id: str,
-    label_ids: List[int],
-    output_tag: str, # e.g., "brainstem", "cerebellum_wm"
-    space: str = "T1", # "T1" or "MNI"
-    tmp_dir: str = ".",
-    verbose: bool = False,
-    session: Optional[str] = None, # Use Optional[str] instead of str | None
-    run: Optional[str] = None     # Use Optional[str] instead of str | None
-) -> Optional[str]:              # Use Optional[str] instead of str | None
-    """
-    Extracts a surface mesh for a structure defined by label IDs in T1 or MNI space.
-
-    Args:
-        subjects_dir (str): Path to derivatives (e.g., fMRIPrep output) or FreeSurfer SUBJECTS_DIR.
-        subject_id (str): Subject identifier (e.g., "sub-01").
-        label_ids (List[int]): List of integer label IDs defining the structure.
-        output_tag (str): A descriptive tag for filenames (e.g., "brainstem").
-        space (str): Space for extraction ("T1" or "MNI"). Default is "T1".
-        tmp_dir (str): Path to the temporary working directory.
-        verbose (bool): Enable verbose output.
-        session (Optional[str]): BIDS session ID.
-        run (Optional[str]): BIDS run ID.
-
-    Returns:
-        Optional[str]: Path to the generated GIFTI surface file, or None on failure.
-    """
-    # Ensure tmp_dir exists
-    Path(tmp_dir).mkdir(parents=True, exist_ok=True)
-
-    # Clean subject_id prefix if present
+# --- ASEG Structure Surface Extraction ---
+def extract_structure_surface( subjects_dir: str, subject_id: str, label_ids: List[int], output_tag: str, space: str = 'T1', tmp_dir: str = '.', verbose: bool = False, session: Optional[str] = None, run: Optional[str] = None ) -> Optional[str]:
+    tmp_dir_path = Path(tmp_dir); tmp_dir_path.mkdir(parents=True, exist_ok=True)
     subject_id_clean = subject_id.replace('sub-', '')
-    anat_dir = Path(subjects_dir) / f"sub-{subject_id_clean}" / "anat" # Construct path correctly
-    output_mask_nii = Path(tmp_dir) / f"{output_tag}_mask_{space}_{uuid.uuid4().hex[:4]}.nii.gz" # Add uuid
-    output_gii = Path(tmp_dir) / f"{output_tag}_{space}.surf.gii"
-
-    # --- Step 1: Get the aseg segmentation in the correct space ---
+    anat_dir = Path(subjects_dir) / f"sub-{subject_id_clean}" / "anat"
+    output_mask_nii_path = tmp_dir_path / f"{output_tag}_mask_space-{space}_id-{uuid.uuid4().hex[:4]}.nii.gz"
+    output_gii_path = tmp_dir_path / f"{output_tag}_space-{space}.surf.gii"
     aseg_in_target_space: Optional[str] = None
-
     try:
         if space.upper() == "T1":
-            aseg_in_target_space = flexible_match(
-                base_dir=anat_dir,
-                subject_id=f"sub-{subject_id_clean}",
-                descriptor="desc-aseg",
-                suffix="dseg",
-                ext=".nii.gz",
-                session=session,
-                run=run
-            )
-
+            L.info(f"Locating T1-space aseg for {subject_id} ({output_tag})")
+            # --- FIX: Use desc-aseg ---
+            aseg_in_target_space = flexible_match( base_dir=anat_dir, subject_id=subject_id, descriptor="desc-aseg", suffix="dseg", ext=".nii.gz", session=session, run=run, logger=L)
+            L.info(f"Found T1-space aseg: {Path(aseg_in_target_space).name}")
         elif space.upper() == "MNI":
-            # Warp aseg from T1 to MNI
-            aseg_t1_path = flexible_match(
-                base_dir=anat_dir, subject_id=f"sub-{subject_id_clean}", descriptor="desc-aseg",
-                suffix="dseg", ext=".nii.gz", session=session, run=run
-            )
-            # Find necessary transforms and template (robustly)
-            xfm_t1_to_mni = flexible_match(
-                base_dir=anat_dir, subject_id=f"sub-{subject_id_clean}",
-                descriptor="from-T1w_to-MNI152NLin2009cAsym_mode-image", suffix="xfm",
-                ext=".h5", session=session, run=run
-            )
-            mni_template = flexible_match(
-                base_dir=anat_dir, subject_id=f"sub-{subject_id_clean}",
-                descriptor="space-MNI152NLin2009cAsym_res-", # Allow diff resolutions
-                suffix="T1w", ext=".nii.gz", session=session, run=run # Find appropriate template
-            )
-
-            aseg_in_target_space_path = Path(tmp_dir) / f"aseg_in_mni_{uuid.uuid4().hex[:4]}.nii.gz"
-            L.info(f"Warping aseg to MNI space: {aseg_in_target_space_path.name}")
-            run_cmd([
-                "antsApplyTransforms", "-d", "3",
-                "-i", aseg_t1_path,
-                "-o", str(aseg_in_target_space_path),
-                "-r", mni_template,
-                "-t", xfm_t1_to_mni,
-                "-n", "NearestNeighbor" # Use Nearest Neighbor for label maps
-            ], verbose=verbose)
-            aseg_in_target_space = str(aseg_in_target_space_path)
-        else:
-            L.error(f"Unsupported space: {space}")
-            return None
-
-    except FileNotFoundError as e:
-        L.error(f"Could not find required file for space '{space}': {e}")
-        return None
-    except Exception as e:
-        L.error(f"Error finding/warping aseg for space '{space}': {e}")
-        return None
-
-
-    if not aseg_in_target_space or not Path(aseg_in_target_space).exists():
-         L.error("Failed to obtain aseg segmentation in target space.")
-         return None
-
-    # --- Step 2: Extract the binary mask for the structure ---
-    success = _extract_structure_mask_t1(
-        aseg_t1_nii=aseg_in_target_space, # Use the (potentially warped) aseg
-        label_ids=label_ids,
-        output_mask_nii=str(output_mask_nii),
-        tmp_dir=tmp_dir,
-        verbose=verbose
-    )
-
-    if not success:
-        L.error(f"Failed to create binary mask for {output_tag} in {space} space.")
-        return None
-
-    # --- Step 3: Convert binary mask volume to GIFTI surface ---
-    try:
-        volume_to_gifti(str(output_mask_nii), str(output_gii), level=0.5)
-        L.info(f"Successfully created surface: {output_gii.name}")
-        return str(output_gii)
-    except Exception as e:
-        L.error(f"Failed to convert mask to surface for {output_tag}: {e}")
-        if Path(output_gii).exists(): # Clean up potentially incomplete output
-             try: os.remove(output_gii)
-             except OSError: pass
-        return None
-
+            L.info(f"Preparing MNI-space aseg for {subject_id} ({output_tag})")
+            # --- FIX: Use desc-aseg ---
+            aseg_t1_path = flexible_match( base_dir=anat_dir, subject_id=subject_id, descriptor="desc-aseg", suffix="dseg", ext=".nii.gz", session=session, run=run, logger=L)
+            L.debug(f"Found T1 aseg: {Path(aseg_t1_path).name}")
+            xfm_t1_to_mni = flexible_match( base_dir=anat_dir, subject_id=subject_id, descriptor="from-T1w_to-MNI152NLin2009cAsym_mode-image", suffix="xfm", ext=".h5", session=session, run=run, logger=L)
+            L.debug(f"Found T1->MNI xfm: {Path(xfm_t1_to_mni).name}")
+            try: # Find MNI space reference geometry (use dseg if possible)
+                mni_ref_path_str = flexible_match( base_dir=anat_dir, subject_id=subject_id, space="MNI152NLin2009cAsym", res="*", descriptor="desc-aseg", suffix="dseg", ext=".nii.gz", session=session, run=run, logger=L)
+            except FileNotFoundError:
+                 try: mni_ref_path_str = flexible_match( base_dir=anat_dir, subject_id=subject_id, space="MNI152NLin2009cAsym", res="*", descriptor="preproc", suffix="T1w", ext=".nii.gz", session=session, run=run, logger=L)
+                 except FileNotFoundError: L.warning(f"MNI ref not found for {subject_id}, using T1 aseg."); mni_ref_path_str = aseg_t1_path
+            warped_aseg_path = tmp_dir_path / f"{output_tag}_aseg_in_mni_id-{uuid.uuid4().hex[:4]}.nii.gz"
+            L.info(f"Warping {Path(aseg_t1_path).name} -> MNI ({warped_aseg_path.name})")
+            run_cmd([ "antsApplyTransforms", "-d", "3", "-i", aseg_t1_path, "-o", str(warped_aseg_path), "-r", mni_ref_path_str, "-t", xfm_t1_to_mni, "-n", "NearestNeighbor" ], verbose=verbose)
+            aseg_in_target_space = str(warped_aseg_path)
+        else: L.error(f"Unsupported ASEG space: {space}"); return None
+    except FileNotFoundError as e: L.error(f"ASEG prep FileNotFoundError: {e}", exc_info=verbose); return None
+    except Exception as e: L.error(f"ASEG prep error: {e}", exc_info=verbose); return None
+    if not aseg_in_target_space or not Path(aseg_in_target_space).exists(): L.error(f"Aseg target space verified fail: '{aseg_in_target_space}'"); return None
+    success = _extract_structure_mask_t1( aseg_in_target_space, label_ids, str(output_mask_nii_path), verbose )
+    if not success: L.error(f"Mask creation failed for {output_tag} in {space}."); return None
+    try: volume_to_gifti(str(output_mask_nii_path), str(output_gii_path), level=0.5); L.info(f"Created GIFTI: {output_gii_path.name}"); return str(output_gii_path)
+    except Exception as e: L.error(f"NIfTI->GIFTI failed for {output_tag}: {e}", exc_info=verbose); return None
 
 # --- Main Surface Generation Function ---
-
-def generate_brain_surfaces(
-    subjects_dir: str,
-    subject_id: str,
-    space: str = "T1",
-    surfaces: Tuple[str, ...] = ("pial",), # e.g., ("pial", "white", "inflated")
-    extract_structures: Optional[List[str]] = None,
-    no_fill_structures: Optional[List[str]] = None,
-    no_smooth_structures: Optional[List[str]] = None,
-    out_warp: str = "warp.nii",
-    run: Optional[str] = None,
-    session: Optional[str] = None,
-    verbose: bool = False,
-    tmp_dir: Optional[str] = None
-) -> Dict[str, Optional[trimesh.Trimesh]]:
-    """
-    Generates cortical surfaces (including inflated) AND extracts other specified structures
-    in T1 or MNI space based on FreeSurfer outputs.
-
-    Args:
-        subjects_dir (str): Path to derivatives or subject data (with /anat subfolder).
-        subject_id (str): Subject identifier (e.g. "sub-01").
-        space (str): "T1" (native) or "MNI" (warped).
-        surfaces (Tuple[str,...]): Which cortical surfaces to load (e.g. ("pial","white","inflated")).
-        extract_structures (Optional[List[str]]): List of additional structures to extract
-            by name (e.g., "brainstem", "cerebellum_wm").
-        no_fill_structures (Optional[List[str]]): List of extracted structure names
-            to skip hole-filling on.
-        no_smooth_structures (Optional[List[str]]): List of extracted structure names
-            to skip smoothing on.
-        out_warp (str): 4D warp field filename if warping to MNI.
-        run (Optional[str]): BIDS run ID.
-        session (Optional[str]): BIDS session ID.
-        verbose (bool): Enable verbose output.
-        tmp_dir (Optional[str]): If provided, use this folder for intermediate files;
-                           otherwise a new one is created and removed.
-
-    Returns:
-        Dict[str, Optional[trimesh.Trimesh]]: Trimesh objects keyed by surface/structure name.
-
-    Raises:
-        ValueError: If 'inflated' surface is requested in 'MNI' space.
-    """
-    # Initialize structure lists if None
+def generate_brain_surfaces( subjects_dir: str, subject_id: str, space: str = "T1", surfaces: Tuple[str, ...] = ("pial",), extract_structures: Optional[List[str]] = None, no_fill_structures: Optional[List[str]] = None, no_smooth_structures: Optional[List[str]] = None, run: Optional[str] = None, session: Optional[str] = None, verbose: bool = False, tmp_dir: Optional[str] = None, preloaded_vtk_meshes: Optional[Dict[str, trimesh.Trimesh]] = None ) -> Dict[str, Optional[trimesh.Trimesh]]:
+    # ... (Initial setup as before) ...
     if extract_structures is None: extract_structures = []
     if no_fill_structures is None: no_fill_structures = []
     if no_smooth_structures is None: no_smooth_structures = []
-
-    # --- Map structure names to label lists ---
-    STRUCTURE_LABEL_MAP = {
-        "brainstem": const.BRAINSTEM_LABEL,
-        "cerebellum_wm": const.CEREBELLUM_WM_LABELS,
-        "cerebellum_cortex": const.CEREBELLUM_CORTEX_LABELS,
-        "cerebellum": const.CEREBELLUM_LABELS,
-        "corpus_callosum": const.CORPUS_CALLOSUM_LABELS,
-    }
-    # Validate requested structures
-    valid_extract_structures = [s for s in extract_structures if s in STRUCTURE_LABEL_MAP]
-    if len(valid_extract_structures) != len(extract_structures):
-         invalid_structs = set(extract_structures) - set(valid_extract_structures)
-         L.warning(f"Requested structure(s) not recognized or constants not defined, skipping: {invalid_structs}")
-    extract_structures = valid_extract_structures # Use only valid ones
-
-    # Map user-requested cortical types to BIDS suffixes, including inflated
-    SURF_NAME_MAP = {
-        "pial": "pial", "mid": "midthickness", "white": "smoothwm", "inflated": "inflated"
-    }
-    processed_surf_types = set() # Keep track of valid requested types
-    for s_type in surfaces:
-        if s_type in SURF_NAME_MAP:
-             processed_surf_types.add(s_type)
-        else:
-             L.warning(f"Unrecognized surface type '{s_type}' requested. Skipping.")
-
-    # --- Check for invalid inflated + MNI combination ---
-    if "inflated" in processed_surf_types and space.upper() == "MNI":
-        # Raise error here to be caught by the CLI
-        raise ValueError("Inflated surfaces cannot be generated in MNI space. Please use --space T1 for inflated surfaces.")
-
-    # --- Setup Temp Dir ---
-    local_tmp = False
-    temp_dir_obj = None # Define for potential cleanup in except block
+    STRUCTURE_LABEL_MAP = { "brainstem": const.BRAINSTEM_LABEL, "cerebellum_wm": const.CEREBELLUM_WM_LABELS, "cerebellum_cortex": const.CEREBELLUM_CORTEX_LABELS, "cerebellum": const.CEREBELLUM_LABELS, "corpus_callosum": const.CORPUS_CALLOSUM_LABELS, }
+    valid_extract_structures = [s for s in extract_structures if s in STRUCTURE_LABEL_MAP];
+    if len(valid_extract_structures) != len(extract_structures): L.warning(f"Ignoring unknown extract_structures: {set(extract_structures) - set(valid_extract_structures)}")
+    extract_structures = valid_extract_structures
+    SURF_NAME_MAP = { "pial": "pial", "mid": "midthickness", "white": "smoothwm", "inflated": "inflated" }
+    processed_surf_types = {s_type for s_type in surfaces if s_type in SURF_NAME_MAP}
+    target_space_id: Optional[str] = None
+    if space.upper() == "T1": space_mode = "T1"
+    elif space.upper() == "MNI": space_mode = "MNI"
+    elif space.startswith("sub-"): space_mode = "SUBJECT"; target_space_id = space
+    else: L.error(f"Invalid space: {space}"); raise ValueError(f"Invalid space: {space}")
+    if space_mode != "T1" and "inflated" in processed_surf_types: L.error("Inflated surf only T1 space"); raise ValueError("Inflated surf only T1 space")
+    local_tmp = False; temp_dir_obj = None
     if not tmp_dir:
-        try:
-             temp_dir_obj = tempfile.TemporaryDirectory(prefix=f"_tmp_surf_{subject_id}_")
-             tmp_dir = temp_dir_obj.name
-             local_tmp = True
-             if verbose: L.info(f"Created local temp dir => {tmp_dir}")
-        except Exception as e:
-            L.error(f"Failed to create temporary directory: {e}")
-            return {} # Return empty if temp dir fails
-    else:
-        # Ensure provided tmp_dir exists if given
-        Path(tmp_dir).mkdir(parents=True, exist_ok=True)
+        try: temp_dir_obj = tempfile.TemporaryDirectory(prefix=f"_tmp_surfgen_{subject_id}_"); tmp_dir_str = temp_dir_obj.name; local_tmp = True; L.info(f"Created local tmp dir: {tmp_dir_str}")
+        except Exception as e: L.error(f"Failed create tmp dir: {e}"); return {}
+    else: tmp_dir_str = str(tmp_dir); Path(tmp_dir_str).mkdir(parents=True, exist_ok=True)
+    tmp_dir_path = Path(tmp_dir_str)
+    subjects_dir_path = Path(subjects_dir)
+    source_subject_id_clean = subject_id.replace('sub-', '')
+    source_anat_dir = subjects_dir_path / f"sub-{source_subject_id_clean}" / "anat"
+    result: Dict[str, Optional[trimesh.Trimesh]] = {}; source_t1_gifti_paths = {}; source_t1_meshes = {}
+    for s in surfaces: result[f"{s}_L"]=None; result[f"{s}_R"]=None # Init keys
+    for s in extract_structures: result[s]=None
+    if preloaded_vtk_meshes:
+        for k in preloaded_vtk_meshes: result[k]=None
 
-    # Clean subject_id prefix if present
-    subject_id_clean = subject_id.replace('sub-', '')
-    anat_dir = Path(subjects_dir) / f"sub-{subject_id_clean}" / "anat" # Construct path correctly
-
-    # --- Initialize Result Dictionary ---
-    result: Dict[str, Optional[trimesh.Trimesh]] = {}
-    for surf_type in processed_surf_types:
-        result[f"{surf_type}_L"] = None
-        result[f"{surf_type}_R"] = None
-    for struct_name in extract_structures:
-        result[struct_name] = None
-
-    # --- Cortical Surface Handling ---
-    t1_gifti_paths = {}
-    warp_field = None
-
+    L.info(f"--- Step 1: Gathering T1 surfaces for {subject_id} ---")
     try:
-        # Find T1 paths for all requested cortical types
         for surf_type in processed_surf_types:
-            actual_name = SURF_NAME_MAP[surf_type] # Already validated
-            lh_file = flexible_match(
-                base_dir=anat_dir, subject_id=f"sub-{subject_id_clean}", descriptor=None,
-                suffix=f"{actual_name}.surf", hemi="hemi-L", ext=".gii", run=run, session=session
-            )
-            rh_file = flexible_match(
-                base_dir=anat_dir, subject_id=f"sub-{subject_id_clean}", descriptor=None,
-                suffix=f"{actual_name}.surf", hemi="hemi-R", ext=".gii", run=run, session=session
-            )
-            t1_gifti_paths[f"{surf_type}_L"] = lh_file
-            t1_gifti_paths[f"{surf_type}_R"] = rh_file
-
-        # --- MNI Space Warping (Inflated already excluded) ---
-        if space.upper() == "MNI":
-            mni_template = flexible_match(base_dir=anat_dir, subject_id=f"sub-{subject_id_clean}", descriptor="space-MNI152NLin2009cAsym_res-", suffix="T1w", ext=".nii.gz", session=session, run=run)
-            t1_preproc = flexible_match(base_dir=anat_dir, subject_id=f"sub-{subject_id_clean}", descriptor="desc-preproc", suffix="T1w", ext=".nii.gz", session=session, run=run)
-            xfm_mni_to_t1 = flexible_match(base_dir=anat_dir, subject_id=f"sub-{subject_id_clean}", descriptor="from-MNI152NLin2009cAsym_to-T1w_mode-image", suffix="xfm", ext=".h5", session=session, run=run)
-            if verbose: L.info(f"MNI->T1 Transform: {xfm_mni_to_t1}")
-            warp_field_path = Path(tmp_dir) / out_warp
-            generate_mrtrix_style_warp(mni_template, t1_preproc, xfm_mni_to_t1, out_warp, tmp_dir, verbose)
-            warp_field = str(warp_field_path)
-
-            for surf_type in processed_surf_types:
-                lh_out = Path(tmp_dir) / f"L_{surf_type}_mni.gii"; rh_out = Path(tmp_dir) / f"R_{surf_type}_mni.gii"
-                warp_gifti_vertices(t1_gifti_paths[f"{surf_type}_L"], warp_field, str(lh_out), verbose=verbose)
-                warp_gifti_vertices(t1_gifti_paths[f"{surf_type}_R"], warp_field, str(rh_out), verbose=verbose)
-                try: result[f"{surf_type}_L"] = gifti_to_trimesh(str(lh_out))
-                except Exception as e: L.warning(f"Failed to load MNI mesh {lh_out.name}: {e}")
-                try: result[f"{surf_type}_R"] = gifti_to_trimesh(str(rh_out))
-                except Exception as e: L.warning(f"Failed to load MNI mesh {rh_out.name}: {e}")
-
-        else: # T1 space
-            for surf_type in processed_surf_types:
-                 try: result[f"{surf_type}_L"] = gifti_to_trimesh(t1_gifti_paths[f"{surf_type}_L"])
-                 except Exception as e: L.warning(f"Failed load T1 {t1_gifti_paths[f'{surf_type}_L']}: {e}")
-                 try: result[f"{surf_type}_R"] = gifti_to_trimesh(t1_gifti_paths[f"{surf_type}_R"])
-                 except Exception as e: L.warning(f"Failed load T1 {t1_gifti_paths[f'{surf_type}_R']}: {e}")
-
-    except FileNotFoundError as e:
-         L.error(f"Failed to find required cortical surface or transform file: {e}")
-         # Fall through to structure extraction, result dict may be partially filled
-    except Exception as e:
-         L.error(f"Error processing cortical surfaces: {e}")
-         # Fall through
-
-    # --- Extract Additional Structures (CBM/BS/CC) ---
-    for struct_name in extract_structures:
-        label_ids = STRUCTURE_LABEL_MAP[struct_name]
-        L.info(f"Extracting ASEG structure: {struct_name} in {space} space...")
-        # Call helper function to extract the surface GII
-        struct_gii_path = extract_structure_surface(
-            subjects_dir=subjects_dir, subject_id=subject_id, # Pass original subject_id here
-            label_ids=label_ids, output_tag=struct_name, space=space,
-            tmp_dir=tmp_dir, verbose=verbose, session=session, run=run
-        )
-        # Load and process the GII file if created
-        if struct_gii_path and Path(struct_gii_path).exists():
+            suffix = SURF_NAME_MAP[surf_type]; L.debug(f"Locating T1 {surf_type} ({suffix})")
             try:
-                mesh = gifti_to_trimesh(struct_gii_path)
-                do_fill = struct_name not in no_fill_structures
-                do_smooth = struct_name not in no_smooth_structures
-                if do_fill:
-                    try: trimesh.repair.fill_holes(mesh); L.info(f"Filled holes for {struct_name}")
-                    except Exception as e_fill: L.warning(f"Hole filling failed for {struct_name}: {e_fill}")
-                if do_smooth:
-                    try: trimesh.smoothing.filter_taubin(mesh, lamb=0.5, nu=-0.53, iterations=10); L.info(f"Smoothed mesh for {struct_name}")
-                    except Exception as e_smooth: L.warning(f"Smoothing failed for {struct_name}: {e_smooth}")
-                mesh.fix_normals()
-                result[struct_name] = mesh
-            except Exception as e_mesh: L.warning(f"Failed load/process mesh {struct_name}: {e_mesh}"); result[struct_name] = None
-        else: L.warning(f"Failed to generate surface file for {struct_name}"); result[struct_name] = None
+                lh = flexible_match(source_anat_dir, subject_id, suffix=f"{suffix}.surf", hemi="L", ext=".gii", run=run, session=session, logger=L); source_t1_gifti_paths[f"{surf_type}_L"]=lh; L.debug(f"Found LH {surf_type}: {Path(lh).name}")
+                rh = flexible_match(source_anat_dir, subject_id, suffix=f"{suffix}.surf", hemi="R", ext=".gii", run=run, session=session, logger=L); source_t1_gifti_paths[f"{surf_type}_R"]=rh; L.debug(f"Found RH {surf_type}: {Path(rh).name}")
+            except FileNotFoundError as e: L.critical(f"Missing T1 FS surf: {e}"); raise
+        for struct_name in extract_structures:
+            labels = STRUCTURE_LABEL_MAP[struct_name]; L.info(f"Extracting ASEG '{struct_name}' in T1...")
+            gii_path = extract_structure_surface( str(subjects_dir_path), subject_id, labels, struct_name, "T1", str(tmp_dir_path), verbose, session, run )
+            if gii_path and Path(gii_path).exists():
+                L.debug(f"ASEG {struct_name} GIFTI: {Path(gii_path).name}")
+                try: mesh = gifti_to_trimesh(gii_path)
+                except Exception as e: L.warning(f"Load {struct_name} GIFTI fail: {e}"); continue
+                if mesh.is_empty: L.warning(f"ASEG {struct_name} empty."); continue
+                if struct_name not in no_fill_structures: L.debug(f"Filling {struct_name}"); trimesh.repair.fill_holes(mesh)
+                if struct_name not in no_smooth_structures: L.debug(f"Smoothing {struct_name}"); trimesh.smoothing.filter_taubin(mesh, lamb=0.5, nu=-0.53, iterations=10)
+                mesh.fix_normals(); source_t1_meshes[struct_name] = mesh; L.info(f"Processed ASEG {struct_name} -> Trimesh.")
+            else: L.warning(f"Failed generate GIFTI for ASEG {struct_name} in T1.")
+    except FileNotFoundError as e: L.critical(f"Failed find critical T1 source: {e}"); sys.exit(1)
+    except Exception as e: L.error(f"Error Step 1: {e}", exc_info=verbose); sys.exit(1)
+    L.info(f"--- Step 1 Done ({len(source_t1_gifti_paths)} cortical paths, {len(source_t1_meshes)} ASEG) ---")
 
-    # --- Cleanup ---
+    L.info(f"--- Step 2: Processing for target space: {space_mode} ---")
+    if space_mode == "T1":
+        L.info("Target=T1. Using native."); # ... (T1 logic as before) ...
+        for key, path in source_t1_gifti_paths.items():
+            if key not in result or result[key] is None:
+                try: L.debug(f"Load T1 {key}"); result[key] = gifti_to_trimesh(path)
+                except Exception as e: L.warning(f"Failed load T1 {key}: {e}")
+        for key, mesh in source_t1_meshes.items(): result[key] = mesh
+        if preloaded_vtk_meshes: L.info(f"Adding {len(preloaded_vtk_meshes)} T1 VTK meshes."); result.update({k:v for k,v in preloaded_vtk_meshes.items() if v and not v.is_empty})
+
+    elif space_mode == "MNI":
+        L.info("Target=MNI. Warping T1 surfaces...");
+        try:
+            t1_prep = flexible_match( source_anat_dir, subject_id, descriptor="preproc", suffix="T1w", ext=".nii.gz", session=session, run=run, logger=L )
+            mni_ref = flexible_match( source_anat_dir, subject_id, session=session, run=run, space="MNI152NLin2009cAsym", res="*", descriptor="preproc", suffix="T1w", ext=".nii.gz", logger=L )
+            mni_to_t1_xfm = flexible_match( source_anat_dir, subject_id, descriptor="from-MNI152NLin2009cAsym_to-T1w_mode-image", suffix="xfm", ext=".h5", session=session, run=run, logger=L )
+            t1_to_mni_warp = tmp_dir_path / f"warp_{subject_id}_T1w-to-MNI.nii.gz"
+            create_mrtrix_warp( str(mni_ref), str(t1_prep), str(mni_to_t1_xfm), str(t1_to_mni_warp), str(tmp_dir_path), verbose )
+            for key, t1_gii in source_t1_gifti_paths.items():
+                mni_gii = tmp_dir_path / f"{key}_space-MNI.gii"; L.debug(f"Warping {key} -> MNI")
+                try: warp_gifti_vertices(t1_gii, str(t1_to_mni_warp), str(mni_gii), verbose); result[key] = gifti_to_trimesh(str(mni_gii)); L.info(f"Warped {key} -> MNI.")
+                except Exception as e: L.warning(f"Failed warp/load MNI {key}: {e}")
+            for key, t1_mesh in source_t1_meshes.items():
+                t1_tmp = tmp_dir_path / f"{key}_T1tmp.gii"; mni_tmp = tmp_dir_path / f"{key}_MNIwarp.gii"; L.debug(f"Warping ASEG {key} -> MNI")
+                try:
+                    coords = nib.gifti.GiftiDataArray(t1_mesh.vertices.astype(np.float32)); faces = nib.gifti.GiftiDataArray(t1_mesh.faces.astype(np.int32))
+                    nib.save(nib.gifti.GiftiImage(darrays=[coords, faces]), str(t1_tmp))
+                    warp_gifti_vertices(str(t1_tmp), str(t1_to_mni_warp), str(mni_tmp), verbose); result[key] = gifti_to_trimesh(str(mni_tmp)); L.info(f"Warped ASEG {key} -> MNI.")
+                except Exception as e: L.warning(f"Failed warp/load MNI ASEG {key}: {e}")
+                finally: t1_tmp.unlink(missing_ok=True)
+            if preloaded_vtk_meshes: L.warning("MNI warp for VTK not implemented. Excluded.")
+        except FileNotFoundError as e: L.critical(f"MNI warp FileNotFoundError: {e}"); sys.exit(1)
+        except Exception as e: L.error(f"MNI warp error: {e}", exc_info=verbose); sys.exit(1)
+
+    elif space_mode == "SUBJECT" and target_space_id:
+        L.info(f"Target=Subject {target_space_id}. Warping {subject_id} -> {target_space_id} via MNI...");
+        target_anat = Path(subjects_dir) / f"sub-{target_space_id.replace('sub-', '')}" / "anat"
+        if not target_anat.is_dir(): L.critical(f"Target subject anat not found: {target_anat}"); sys.exit(1)
+        try:
+            # S1 Files
+            s1_t1 = flexible_match( source_anat_dir, subject_id, descriptor="preproc", suffix="T1w", ext=".nii.gz", session=session, run=run, logger=L )
+            s1_mni = flexible_match( source_anat_dir, subject_id, space="MNI152NLin2009cAsym", res="*", descriptor="preproc", suffix="T1w", ext=".nii.gz", session=session, run=run, logger=L )
+            s1_mni2t1_xfm = flexible_match( source_anat_dir, subject_id, descriptor="from-MNI152NLin2009cAsym_to-T1w_mode-image", suffix="xfm", ext=".h5", session=session, run=run, logger=L )
+            # S2 Files
+            s2_t1 = flexible_match( target_anat, target_space_id, descriptor="preproc", suffix="T1w", ext=".nii.gz", logger=L )
+            s2_t12mni_xfm = flexible_match( target_anat, target_space_id, descriptor="from-T1w_to-MNI152NLin2009cAsym_mode-image", suffix="xfm", ext=".h5", logger=L )
+            try: s2_mni = flexible_match( target_anat, target_space_id, space="MNI152NLin2009cAsym", res="*", descriptor="preproc", suffix="T1w", ext=".nii.gz", logger=L )
+            except FileNotFoundError: L.warning(f"MNI ref not found in {target_space_id}, using source's."); s2_mni = s1_mni
+            # Warps
+            warp_s1_mni = tmp_dir_path/f"_{subject_id}_to_MNI.nii.gz"; create_mrtrix_warp(str(s1_mni), str(s1_t1), str(s1_mni2t1_xfm), str(warp_s1_mni), str(tmp_dir_path), verbose)
+            warp_mni_s2 = tmp_dir_path/f"_MNI_to_{target_space_id}.nii.gz"; create_mrtrix_warp(str(s2_t1), str(s2_mni), str(s2_t12mni_xfm), str(warp_mni_s2), str(tmp_dir_path), verbose)
+            # Apply Cortical
+            for key, s1_gii in source_t1_gifti_paths.items():
+                mni_gii = tmp_dir_path/f"_{subject_id}_{key}_MNI.gii"
+                s2_gii = tmp_dir_path/f"{key}_{target_space_id}.gii"
+                try: 
+                    L.debug(f"{key}: S1->MNI")
+                    warp_gifti_vertices(s1_gii, str(warp_s1_mni), str(mni_gii), verbose)
+                    L.debug(f"{key}: MNI->S2")
+                    warp_gifti_vertices(str(mni_gii), str(warp_mni_s2), str(s2_gii), verbose)
+                    result[key] = gifti_to_trimesh(str(s2_gii))
+                    L.info(f"Warped cortical {key} -> {target_space_id}.")
+                except Exception as e:
+                    L.warning(f"Failed to warp {key}: {e}")
+                    if mni_gii.exists():
+                        mni_gii.unlink()
+                    if s2_gii.exists():
+                        s2_gii.unlink()
+                    continue
+            # Apply ASEG
+            for key, s1_mesh in source_t1_meshes.items():
+                t1_gii = tmp_dir_path/f"_{subject_id}_{key}_T1.gii"
+                mni_gii = tmp_dir_path/f"_{subject_id}_{key}_MNI.gii"
+                s2_gii = tmp_dir_path/f"{key}_{target_space_id}warp.gii"
+                try:
+                    # Convert mesh to GIFTI
+                    coords = nib.gifti.GiftiDataArray(s1_mesh.vertices.astype(np.float32))
+                    faces = nib.gifti.GiftiDataArray(s1_mesh.faces.astype(np.int32))
+                    nib.save(nib.gifti.GiftiImage(darrays=[coords, faces]), str(t1_gii))
+                    
+                    # First warp to MNI
+                    L.debug(f"ASEG {key}: S1->MNI")
+                    warp_gifti_vertices(str(t1_gii), str(warp_s1_mni), str(mni_gii), verbose)
+                    
+                    # Then warp to target subject
+                    L.debug(f"ASEG {key}: MNI->S2")
+                    warp_gifti_vertices(str(mni_gii), str(warp_mni_s2), str(s2_gii), verbose)
+                    result[key] = gifti_to_trimesh(str(s2_gii))
+                    L.info(f"Warped ASEG {key} -> {target_space_id}.")
+                except Exception as e:
+                    L.warning(f"Failed to warp ASEG {key}: {e}")
+                    for f in [t1_gii, mni_gii, s2_gii]:
+                        if f.exists():
+                            f.unlink()
+                    continue
+            if preloaded_vtk_meshes: L.warning(f"Subject warp for VTK not implemented. Excluded.")
+        except FileNotFoundError as e: L.critical(f"Cannot find file/xfm for subject warp: {e}"); sys.exit(1)
+        except Exception as e: L.error(f"General error subject warp: {e}", exc_info=verbose); sys.exit(1)
+    L.info(f"--- Step 2 Done: Processed for {space_mode} ---")
+
     if local_tmp and temp_dir_obj:
-        try: temp_dir_obj.cleanup(); L.info(f"Removed local temp dir => {tmp_dir}")
-        except Exception as e_clean: L.warning(f"Failed remove temp dir {tmp_dir}: {e_clean}")
+        try: temp_dir_obj.cleanup(); L.info(f"Removed tmp dir: {tmp_dir_str}")
+        except Exception as e: L.warning(f"Failed remove tmp dir {tmp_dir_str}: {e}")
+    final_result = {k: v for k, v in result.items() if isinstance(v, trimesh.Trimesh) and not v.is_empty}
+    L.info(f"generate_brain_surfaces returning {len(final_result)} meshes: {list(final_result.keys())}")
+    if len(result) != len(final_result): L.warning(f"{len(result) - len(final_result)} meshes excluded.")
+    return final_result
 
-    return result
-
-
-# --- 5ttgen Function (MODIFIED for work directory) ---
-
-def run_5ttgen_hsvs_save_temp_bids(
-    subject_id: str,
-    fs_subject_dir: str, # Path to the input FreeSurfer subject directory.
-    subject_work_dir: Union[str, Path], # MODIFIED: Path to the dedicated work dir for this subject/session
-    # bids_root_dir: str, # REMOVED: No longer needed for BIDS derivative saving
-    # pipeline_name: str = "brain_for_printing_5ttgen", # REMOVED: No longer managing BIDS structure here
-    session_id: Optional[str] = None, # Kept for potential logging/internal use
-    nocrop: bool = True,
-    sgm_amyg_hipp: bool = True,
-) -> Optional[str]:
-    """
-    Runs 5ttgen hsvs using a FreeSurfer directory as input, using a
-    dedicated subject work directory for its scratch space, keeping the results.
-
-    Args:
-        subject_id (str): Subject identifier (e.g., "sub-01").
-        fs_subject_dir (str): Path to the input FreeSurfer subject directory.
-        subject_work_dir (Union[str, Path]): Path to the dedicated work directory
-            for this subject/session (e.g., <work_dir>/brain_for_printing/sub-01/ses-A).
-            This function assumes the base work directory structure already exists.
-        session_id (Optional[str]): BIDS session ID (used primarily for logging now).
-        nocrop (bool): Corresponds to the -nocrop option in 5ttgen.
-        sgm_amyg_hipp (bool): Corresponds to the -sgm_amyg_hipp option in 5ttgen.
-
-    Returns:
-        Optional[str]: Path to the persistent 5ttgen working directory within the
-                       subject_work_dir on success, or None on failure.
-    """
-    subject_work_dir = Path(subject_work_dir)
-    subject_label_clean = subject_id.replace('sub-', '')
-    sub_label = f"sub-{subject_label_clean}"
-    ses_label = f"ses-{session_id}" if session_id else None
-
-    # --- Define the persistent path within the subject's work directory ---
-    persistent_5ttgen_path = subject_work_dir / "5ttgen_persistent_work"
-
-    # --- Prepare and run 5ttgen command ---
-    # Ensure the persistent directory exists before running 5ttgen
+# --- 5ttgen Function ---
+# ... (As previously corrected) ...
+def run_5ttgen_hsvs_save_temp_bids( subject_id: str, fs_subject_dir: str, subject_work_dir: str, session_id: Optional[str] = None, nocrop: bool = True, sgm_amyg_hipp: bool = True, verbose: bool = False ) -> Optional[str]:
+    subject_work_dir_path = Path(subject_work_dir); sub_label = f"sub-{subject_id}"; ses_label = f"ses-{session_id}" if session_id else None; persistent_5ttgen_path = subject_work_dir_path / "5ttgen_persistent_work"
+    try: persistent_5ttgen_path.mkdir(parents=True, exist_ok=True); L.info(f"Ensured 5ttgen persistent dir: {persistent_5ttgen_path}")
+    except Exception as e: L.error(f"Failed create 5ttgen dir {persistent_5ttgen_path}: {e}"); return None
+    fname_5tt_parts = [sub_label];
+    if ses_label: fname_5tt_parts.append(ses_label);
+    fname_5tt_parts.append("desc-5ttgen_dseg.nii.gz"); final_5tt_out = persistent_5ttgen_path / "_".join(fname_5tt_parts)
+    cmd = ["5ttgen", "hsvs", str(Path(fs_subject_dir)), str(final_5tt_out), "-scratch", str(persistent_5ttgen_path)];
+    if nocrop: cmd.append("-nocrop");
+    if sgm_amyg_hipp: cmd.append("-sgm_amyg_hipp");
+    cmd.append("-nocleanup"); L.info(f"Running 5ttgen: {' '.join(cmd)}")
     try:
-        persistent_5ttgen_path.mkdir(parents=True, exist_ok=True)
-        L.info(f"Ensured persistent 5ttgen work directory exists: {persistent_5ttgen_path}")
-    except Exception as e:
-        L.error(f"Failed to create persistent 5ttgen work directory {persistent_5ttgen_path}: {e}")
-        return None
+        proc = subprocess.run(cmd, check=True, capture_output=True, text=True); L.info("5ttgen completed."); L.debug(f"stdout: {proc.stdout}"); L.debug(f"stderr: {proc.stderr}")
+        if not final_5tt_out.exists(): L.warning(f"Main 5ttgen NIfTI {final_5tt_out} not found.")
+        nested_dirs = list(persistent_5ttgen_path.glob("5ttgen-tmp-*"))
+        if not nested_dirs: L.error(f"No '5ttgen-tmp-*' dir in {persistent_5ttgen_path}. VTK missing?")
+        else: L.info(f"Found 5ttgen tmp dir: {nested_dirs[0]}.")
+        L.info(f"5ttgen outputs retained at: {persistent_5ttgen_path}"); return str(persistent_5ttgen_path)
+    except subprocess.CalledProcessError as e: L.error(f"5ttgen failed (Code {e.returncode}).", exc_info=verbose); L.error(f"Stderr: {e.stderr}")
+    except Exception as e: L.error(f"Unexpected error during 5ttgen: {e}", exc_info=verbose)
+    L.warning(f"5ttgen failed. Dir {persistent_5ttgen_path} may have partial outputs."); return None
 
-    # Define the path for the intermediate 5TT output file (required by 5ttgen)
-    # Store it inside the persistent path as well.
-    temp_output_5tt = persistent_5ttgen_path / f"{sub_label}{'_'+ses_label if ses_label else ''}_5ttgen_output.nii.gz"
+# --- VTK Loading Function ---
+# ... (As previously corrected, depends on VTK_AVAILABLE) ...
+def load_subcortical_and_ventricle_meshes( five_ttgen_persistent_dir_str: str ) -> Dict[str, trimesh.Trimesh]:
+    loaded_meshes: Dict[str, trimesh.Trimesh] = {};
+    if not VTK_AVAILABLE: L.error("VTK unavailable."); return loaded_meshes
+    persistent_work_dir = Path(five_ttgen_persistent_dir_str);
+    if not persistent_work_dir.is_dir(): L.error(f"5ttgen dir not found: {persistent_work_dir}"); return loaded_meshes
+    nested_dirs = list(persistent_work_dir.glob("5ttgen-tmp-*"));
+    if not nested_dirs: L.warning(f"No '5ttgen-tmp-*' dir in {persistent_work_dir}. Searching root."); search_dir = persistent_work_dir
+    else: search_dir = nested_dirs[0]; L.info(f"Searching VTK in: {search_dir}")
+    skipped = 0; sgm_pattern = str(search_dir / "first-*_transformed.vtk"); sgm_files = glob.glob(sgm_pattern); L.info(f"Found {len(sgm_files)} SGM files.")
+    for p_str in sgm_files:
+        p = Path(p_str); fn = p.name;
+        if fn.startswith("first-") and fn.endswith("_transformed.vtk"): name = fn[len("first-"):-len("_transformed.vtk")]; key = f"subcortical-{name}"
+        else: L.warning(f"Skipping SGM file: {fn}"); skipped+=1; continue
+        if not name: L.warning(f"Skipping SGM empty name: {fn}"); skipped+=1; continue
+        try: poly = _read_vtk_polydata(str(p), L); mesh = _vtk_polydata_to_trimesh(poly) if poly else None
+        except Exception as e: L.warning(f"Err proc SGM {fn} ({key}): {e}"); skipped+=1; continue
+        if mesh and not mesh.is_empty: loaded_meshes[key] = mesh; L.info(f"Loaded SGM: {key}")
+        else: L.debug(f"Skip empty/failed SGM {key}"); skipped+=1
+    other_files = [p for p in search_dir.glob("*.vtk") if not p.name.startswith("first-")]; L.info(f"Found {len(other_files)} other VTK files.")
+    vent_kw = ["ventricle", "vent", "choroid", "plexus", "latvent", "inf-lat-vent"]; vessel_kw = ["vessel"]; csf_kw = ["csf"]; skip_kw = ["_init", "gm_", "wm_", "brain_"]
+    for p in other_files:
+        fn_low = p.name.lower(); base = p.stem;
+        if any(sk in fn_low for sk in skip_kw): L.debug(f"Skip intermediate VTK: {p.name}"); continue
+        prefix = ""; name_part = base.replace("_transformed", "").replace("_surf", "").replace("_vol", "").replace("seg_", "")
+        if any(kw in fn_low for kw in vent_kw): prefix = "ventricle"
+        elif any(kw in fn_low for kw in vessel_kw): prefix = "vessel"
+        elif any(kw in fn_low for kw in csf_kw): prefix = "csf"
+        else: L.debug(f"Skip unrecog VTK: {p.name}"); skipped+=1; continue
+        key = f"{prefix}-{name_part}"
+        if key in loaded_meshes: L.debug(f"Key {key} exists. Skip {p.name}."); continue
+        try: poly = _read_vtk_polydata(str(p), L); mesh = _vtk_polydata_to_trimesh(poly) if poly else None
+        except Exception as e: L.warning(f"Err proc other VTK {p.name} ({key}): {e}"); skipped+=1; continue
+        if mesh and not mesh.is_empty: loaded_meshes[key] = mesh; L.info(f"Loaded {prefix}: {key}")
+        else: L.debug(f"Skip empty/failed {prefix} {key}"); skipped+=1
+    if skipped > 0: L.warning(f"Skipped {skipped} VTK files.")
+    L.info(f"VTK loading done. {len(loaded_meshes)} meshes loaded: {list(loaded_meshes.keys())}"); return loaded_meshes
 
-    # Build the 5ttgen command list
-    cmd = ["5ttgen", "hsvs", fs_subject_dir, str(temp_output_5tt)] # Input is fs_subject_dir
-    # Use the persistent path directly as the scratch directory
-    cmd.extend(["-scratch", str(persistent_5ttgen_path)])
-    if nocrop: cmd.append("-nocrop")
-    if sgm_amyg_hipp: cmd.append("-sgm_amyg_hipp")
-    cmd.append("-nocleanup") # Keep the contents of the scratch directory
-
-    L.info(f"Running 5ttgen: {' '.join(cmd)}")
-    try:
-        # Execute the command
-        process = subprocess.run(cmd, check=True, capture_output=True, text=True)
-        L.info("5ttgen hsvs completed successfully.")
-
-        # --- Verify output ---
-        # Check if the 5TT output file was created (basic check)
-        if not temp_output_5tt.exists() or temp_output_5tt.stat().st_size == 0:
-             L.warning(f"5ttgen main output file missing or empty: {temp_output_5tt}")
-             # Decide if this is critical - might depend on whether the VTKs are needed
-             # For now, we proceed assuming the VTK files might still exist
-
-        # Check if the nested '5ttgen-tmp-*' directory was created inside persistent_5ttgen_path
-        potential_nested_dirs = list(persistent_5ttgen_path.glob("5ttgen-tmp-*"))
-        if not potential_nested_dirs:
-            L.error(f"No '5ttgen-tmp-*' subdirectory found within {persistent_5ttgen_path} after 5ttgen run.")
-            # Cleanup and return failure if the essential subdir is missing
+# --- VTK Helper Functions ---
+if VTK_AVAILABLE:
+    def _read_vtk_polydata(path: str, logger: logging.Logger) -> Optional[vtk.vtkPolyData]:
+        logger.debug(f"Reading VTK: {path}")
+        if not Path(path).exists(): logger.error(f"VTK file not found: {path}"); return None
+        reader_types = [vtk.vtkSTLReader, vtk.vtkPolyDataReader, vtk.vtkXMLPolyDataReader, vtk.vtkGenericDataObjectReader]
+        for reader_class in reader_types:
             try:
-                shutil.rmtree(persistent_5ttgen_path)
-                L.info(f"Cleaned up persistent work directory on verification failure: {persistent_5ttgen_path}")
-            except Exception as e_clean:
-                L.error(f"Failed to clean up persistent work directory {persistent_5ttgen_path} after verification failure: {e_clean}")
-            return None
+                reader = reader_class(); reader.SetFileName(path); reader.Update()
+                poly_data_output = None
+                if isinstance(reader, vtk.vtkGenericDataObjectReader):
+                    if reader.IsFilePolyData(): poly_data_output = reader.GetPolyDataOutput()
+                    else: logger.debug(f"vtkGeneric reports {path} not PolyData."); continue
+                elif hasattr(reader, 'GetOutput') and isinstance(reader.GetOutput(), vtk.vtkPolyData): poly_data_output = reader.GetOutput()
+                if poly_data_output and poly_data_output.GetNumberOfPoints() > 0: logger.info(f"Read {Path(path).name} via {reader_class.__name__}."); return poly_data_output
+                else: logger.debug(f"{reader_class.__name__} gave no/empty PolyData for {path}.")
+            except Exception as e_reader: logger.debug(f"{reader_class.__name__} failed for {path}: {e_reader}")
+        logger.warning(f"Could not read valid PolyData from VTK file {path}."); return None
 
-        if len(potential_nested_dirs) > 1:
-            L.warning(f"Multiple '5ttgen-tmp-*' subdirectories found in {persistent_5ttgen_path}. This is unexpected with -nocleanup.")
-            # Proceeding with the first one found, but log a warning.
-
-        L.info(f"5ttgen outputs retained in persistent work directory: {persistent_5ttgen_path}")
-        return str(persistent_5ttgen_path) # Return the path on success
-
-    except subprocess.CalledProcessError as e:
-        L.error(f"5ttgen failed: {e.returncode}\nCMD: {' '.join(e.cmd)}\nSTDERR: {e.stderr}")
-        # --- Post-5ttgen (Failure): Delete the entire persistent directory ---
-        try:
-            if persistent_5ttgen_path.exists():
-                shutil.rmtree(persistent_5ttgen_path)
-                L.info(f"Cleaned up persistent work directory on failure: {persistent_5ttgen_path}")
-        except Exception as e_clean:
-            L.error(f"Failed to clean up persistent work directory {persistent_5ttgen_path} after failure: {e_clean}")
-        return None
-    except Exception as e:
-        L.error(f"Unexpected error during/after 5ttgen: {e}")
-        # --- Post-5ttgen (Failure): Delete the entire persistent directory ---
-        try:
-            if persistent_5ttgen_path.exists():
-                shutil.rmtree(persistent_5ttgen_path)
-                L.info(f"Cleaned up persistent work directory on error: {persistent_5ttgen_path}")
-        except Exception as e_clean:
-            L.error(f"Failed to clean up persistent work directory {persistent_5ttgen_path} after error: {e_clean}")
-        return None
-
-    # Note: No BIDS dataset_description.json handling needed here anymore.
-
-# Added import for numpy_support
-from vtk.util import numpy_support
-import vtk # Ensure vtk is imported
-
-# --- Helper Function to read VTK using vtk library ---
-def _read_vtk_polydata(path: str) -> Optional[vtk.vtkPolyData]:
-    """Reads a VTK polydata file using vtkPolyDataReader."""
-    try:
-        reader = vtk.vtkPolyDataReader()
-        reader.SetFileName(path)
-        reader.Update()
-        if reader.GetErrorCode():
-            L.error(f"VTK reader error code {reader.GetErrorCode()} for {path}")
-            return None
-        polydata = reader.GetOutput()
-        if polydata and polydata.GetNumberOfPoints() > 0 and polydata.GetNumberOfCells() > 0:
-            return polydata
-        else:
-            L.warning(f"VTK file seems empty or invalid: {path}")
-            return None
-    except Exception as e:
-        L.error(f"Failed to read VTK file {path} using vtk library: {e}")
-        return None
-
-# --- Helper Function to convert vtkPolyData to Trimesh ---
-def _vtk_polydata_to_trimesh(polydata: vtk.vtkPolyData) -> Optional[trimesh.Trimesh]:
-    """Converts a vtk.vtkPolyData object to a trimesh.Trimesh object."""
-    try:
-        # Get vertices
-        points = polydata.GetPoints()
-        if not points: return None
-        vertices = numpy_support.vtk_to_numpy(points.GetData())
-        if vertices.shape[0] == 0: return None
-
-        # Get faces (assuming triangles)
-        polys = polydata.GetPolys()
-        if not polys: return None
-        faces_vtk = numpy_support.vtk_to_numpy(polys.GetData())
-
-        # VTK faces array is like [n_verts1, v1_idx1, v1_idx2, ..., n_verts2, v2_idx1, ...]
-        # We need to parse this assuming n_verts is always 3 for triangles
-        if faces_vtk.shape[0] == 0: return None
-        faces = []
-        i = 0
-        while i < len(faces_vtk):
-            n_verts = faces_vtk[i]
-            if n_verts == 3: # It's a triangle
-                faces.append(faces_vtk[i+1 : i+1+n_verts])
-            else:
-                 L.warning(f"Non-triangular polygon encountered (num_vertices={n_verts}), skipping cell in VTK conversion.")
-            i += (n_verts + 1) # Move to the next cell definition
-
-        if not faces: return None
-        # Ensure numpy is imported
-        import numpy as np
-        faces_np = np.array(faces, dtype=np.int64) # Use int64 for trimesh
-
-        # Create Trimesh object
-        mesh = trimesh.Trimesh(vertices=vertices, faces=faces_np)
-        # Optional: Check and potentially repair before returning
-        # mesh.process() # This can sometimes fail on complex meshes
-        mesh.remove_degenerate_faces()
-        mesh.remove_unreferenced_vertices()
-        mesh.fix_normals() # Fix normals after potential repairs
-        return mesh
-
-    except Exception as e:
-        L.error(f"Failed to convert vtkPolyData to Trimesh: {e}")
-        return None
-
-
-def load_subcortical_and_ventricle_meshes(five_ttgen_dir: Union[str, Path]) -> Dict[str, trimesh.Trimesh]:
-    """
-    Loads FSL FIRST (subcortical-*) and Ventricle/Vessel (ventricle-*, vessel-*)
-    VTK files from a **persistent 5ttgen work directory**, searching within
-    the nested '5ttgen-tmp-*' subdir. Converts to Trimesh objects.
-
-    Args:
-        five_ttgen_dir (Union[str, Path]): Path to the persistent 5ttgen work
-                                          directory (e.g., .../5ttgen_persistent_work/).
-
-    Returns:
-        Dict[str, trimesh.Trimesh]: Dictionary mapping derived structure name
-                                   (e.g., "subcortical-L_Thalamus", "ventricle-LatVent")
-                                   to the loaded Trimesh object.
-    """
-    loaded_meshes: Dict[str, trimesh.Trimesh] = {}
-    persistent_work_dir = Path(five_ttgen_dir) # Rename for clarity
-
-    if not persistent_work_dir.is_dir():
-        L.error(f"Provided persistent 5ttgen work directory not found: {persistent_work_dir}")
-        return loaded_meshes
-
-    # --- Find the actual data directory nested inside ---
-    # 5ttgen with -nocleanup keeps files inside a '5ttgen-tmp-*' directory
-    # within the specified scratch path.
-    potential_nested_dirs = list(persistent_work_dir.glob("5ttgen-tmp-*"))
-    if not potential_nested_dirs:
-        L.error(f"Could not find the '5ttgen-tmp-*' subdirectory inside the persistent work dir: {persistent_work_dir}")
-        return loaded_meshes
-
-    if len(potential_nested_dirs) > 1:
-        L.warning(f"Multiple '5ttgen-tmp-*' subdirs found in {persistent_work_dir}. Using the first: {potential_nested_dirs[0]}")
-
-    search_dir = potential_nested_dirs[0] # This is where the VTK files actually are
-    L.info(f"Searching for VTK files within: {search_dir}")
-
-    skipped_count = 0
-
-    # === Subcortical Structures (FSL FIRST output) ===
-    # Updated glob pattern to search inside search_dir
-    subcortical_pattern = str(search_dir / "first-*_transformed.vtk")
-    raw_subcortical_glob = glob.glob(subcortical_pattern)
-    # Filtering logic remains the same
-    subcortical_candidates = [
-        p for p in raw_subcortical_glob
-        if not Path(p).name.endswith("_first_transformed.vtk")
-    ]
-    L.info(f"Found {len(subcortical_candidates)} potential FIRST subcortical VTK files (after filtering).")
-
-    for vtk_path_str in subcortical_candidates:
-        vtk_path = Path(vtk_path_str); struct_name = None
-        # Naming logic remains the same
-        filename = vtk_path.name
-        if filename.startswith("first-") and filename.endswith("_transformed.vtk"):
-             name_part = filename[len("first-"):-len("_transformed.vtk")]
-             struct_name = f"subcortical-{name_part}"
-        else:
-             L.warning(f"Unexpected subcortical filename format: {filename}. Skipping naming.")
-             struct_name = f"subcortical-unknown-{vtk_path.stem}"
-
-        L.debug(f"Attempting to load subcortical VTK: {vtk_path.name} as {struct_name} using vtk library")
-
-        polydata = _read_vtk_polydata(vtk_path_str)
-        if polydata:
-            mesh = _vtk_polydata_to_trimesh(polydata)
-            if mesh and not mesh.is_empty:
-                loaded_meshes[struct_name] = mesh
-                L.debug(f"Successfully loaded and converted {struct_name}")
-            else:
-                L.warning(f"Failed to convert {struct_name} from vtkPolyData to Trimesh or result was empty.")
-                skipped_count += 1
-        else:
-            skipped_count += 1
-
-    # === Ventricles, Choroid Plexus, Vessels ===
-    ventricle_tags = ["Ventricle", "LatVent", "ChorPlex", "Inf-Lat-Vent", "vessel"]
-    # Updated glob pattern to search inside search_dir
-    all_vtk_pattern = str(search_dir / "*.vtk")
-    raw_ventricle_glob = glob.glob(all_vtk_pattern)
-    # Filtering logic remains the same
-    ventricle_candidates = [
-        f for f in raw_ventricle_glob
-        if any(tag in Path(f).name for tag in ventricle_tags)
-        and not Path(f).name.endswith("_init.vtk")
-        and "_first" not in Path(f).name
-    ]
-    L.info(f"Found {len(ventricle_candidates)} potential Ventricle/Vessel VTK files (after filtering).")
-
-    for vtk_path_str in ventricle_candidates:
-        vtk_path = Path(vtk_path_str); struct_name = None
-        # Naming logic remains the same
-        base_name = vtk_path.stem
-        struct_prefix = "vessel" if "vessel" in base_name.lower() else "ventricle"
-        struct_name = f"{struct_prefix}-{base_name}"
-
-        L.debug(f"Attempting to load ventricle/vessel VTK: {vtk_path.name} as {struct_name} using vtk library")
-        polydata = _read_vtk_polydata(vtk_path_str)
-        if polydata:
-            mesh = _vtk_polydata_to_trimesh(polydata)
-            if mesh and not mesh.is_empty:
-                 # Optional: Invert normals if needed for these structures
-                 # L.debug(f"Inverting normals for {struct_name}"); mesh.invert()
-                 loaded_meshes[struct_name] = mesh
-                 L.debug(f"Successfully loaded and converted {struct_name}")
-            else:
-                 L.warning(f"Failed to convert {struct_name} from vtkPolyData to Trimesh or result was empty.")
-                 skipped_count += 1
-        else:
-            skipped_count += 1
-
-    if skipped_count > 0: L.warning(f"Skipped loading/converting {skipped_count} VTK files.")
-    L.info(f"Loaded {len(loaded_meshes)} VTK-derived meshes in total.")
-    return loaded_meshes
+    def _vtk_polydata_to_trimesh(poly_data: Optional[vtk.vtkPolyData]) -> Optional[trimesh.Trimesh]:
+        if not VTK_AVAILABLE or poly_data is None or poly_data.GetNumberOfPoints() == 0: return None
+        num_pts = poly_data.GetPoints().GetNumberOfPoints(); verts = np.zeros((num_pts, 3))
+        for i in range(num_pts): verts[i, :] = poly_data.GetPoints().GetPoint(i)
+        faces = []; ids = vtk.vtkIdList()
+        polys = poly_data.GetPolys();
+        if polys and polys.GetNumberOfCells() > 0:
+            polys.InitTraversal();
+            while polys.GetNextCell(ids): faces.append([ids.GetId(j) for j in range(ids.GetNumberOfIds())])
+        elif poly_data.GetStrips() and poly_data.GetStrips().GetNumberOfCells() > 0:
+             strips = poly_data.GetStrips(); strips.InitTraversal(); L.warning("VTK has strips, may be lossy.")
+             while strips.GetNextCell(ids):
+                 for j in range(ids.GetNumberOfIds() - 2): faces.append([ids.GetId(j + (j % 2)), ids.GetId(j + 1 - (j % 2)), ids.GetId(j + 2)])
+        if not faces: L.warning("VTK has points but no faces."); return trimesh.Trimesh(vertices=verts)
+        try: mesh = trimesh.Trimesh(vertices=verts, faces=np.array(faces), process=True); return None if mesh.is_empty else mesh
+        except Exception as e: L.error(f"Failed Trimesh creation: {e}"); return None

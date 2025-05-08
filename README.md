@@ -1,6 +1,6 @@
-# Brain For Printing
+# Brain For Printing
 
-Generate **3 D‑printable brain surfaces** (cortical + optional brainstem) in T1 or MNI space, colour them from parametric volumes, slice them into stackable slabs, or hollow the ventricular system – all from the command line.
+Generate **3 D‑printable brain surfaces** (cortical + optional brainstem) in T1, MNI, or target subject space, colour them from parametric volumes, slice them into stackable slabs, or hollow the ventricular system – all from the command line.
 
 The core is pure‑Python (`trimesh`, `nibabel`, `scikit‑image`) while heavy lifting is delegated to familiar neuro‑tools (FreeSurfer, FSL, ANTs, MRtrix3).  Every CLI writes a timestamped JSON *run‑log* for provenance and supports structured console logging via `‑v/‑‑verbose`.
 
@@ -10,8 +10,8 @@ The core is pure‑Python (`trimesh`, `nibabel`, `scikit‑image`) while heavy l
 
 | Area | Highlights |
 |------|------------|
-| **Surface extraction** | • LH/RH pial, white, **or** mid surfaces in T1 or warped MNI.<br>• Optional brainstem extraction with hole‑fill & smoothing.<br>• Automatic ANTs→MRtrix 4‑D warp generation. |
-| **Colouring** | • Sample NIfTI param maps per‑vertex.<br>• Thresholding & discrete colour bins.<br>• Works on existing STL/OBJ/GIFTI **or** freshly generated surfaces. |
+| **Surface extraction** | • LH/RH pial, white, **or** mid surfaces in T1, MNI, or target subject space.<br>• Optional brainstem extraction with hole‑fill & smoothing.<br>• Automatic ANTs→MRtrix 4‑D warp generation.<br>• Subject-to-subject warping support. |
+| **Colouring** | • Sample NIfTI param maps per‑vertex in source or target space.<br>• Thresholding & discrete colour bins.<br>• Works on existing STL/OBJ/GIFTI **or** freshly generated surfaces.<br>• Flexible sampling surface selection (white, pial, mid). |
 | **Mesh ops** | • Voxel remesh + repair helper.<br>• Ventricular hollowing via boolean difference.<br>• Slab slicing with per‑slab bounding‑box padding. |
 
 ---
@@ -27,7 +27,7 @@ The core is pure‑Python (`trimesh`, `nibabel`, `scikit‑image`) while heavy l
  pip install -e .
 ```
 
-> **Python ≥3.8** recommended.  All Python dependencies are pulled in automatically.
+> **Python ≥3.8** recommended.  All Python dependencies are pulled in automatically.
 
 ---
 
@@ -65,7 +65,7 @@ Run any command with `‑h/‑‑help` for full argument reference.
 
 ## Quick‑start examples
 
-### 1  Cortical surfaces + brainstem (T1)
+### 1  Cortical surfaces + brainstem (T1)
 
 ```bash
 brain_for_printing_cortical_surfaces \
@@ -77,24 +77,50 @@ brain_for_printing_cortical_surfaces \
   --split_hemis         # export LH / RH / BS separately
 ```
 
-*Flags of note*  `--surf_type pial|white|mid`   `--no_brainstem`   `--no_clean`   `‑v`
+*Flags of note*  
+- `--surf_type pial|white|mid`  
+- `--no_brainstem`  
+- `--no_clean`  
+- `‑v`
 
-### 2  Generate & colour mid‑thickness surfaces in MNI
+### 2  Generate & colour surfaces in different spaces
 
 ```bash
-brain_for_printing_color surface \
+# Color in MNI space
+brain_for_printing_color preset \
   --subjects_dir /derivatives \
-  --subject_id sub‑01 \
+  --subject_id sub-01 \
   --space MNI \
-  --surf_type mid \
+  --color_in target \
   --param_map tstat_in_MNI.nii.gz \
-  --param_threshold 2.3 \
+  --color_sampling_surf white \
+  --num_colors 9 \
   --output_dir ./coloured_models \
-  --split_hemis \
+  --preset pial_brain \
+  -v
+
+# Color in source space then warp to target subject
+brain_for_printing_color preset \
+  --subjects_dir /derivatives \
+  --subject_id sub-01 \
+  --space sub-02 \
+  --color_in source \
+  --param_map tstat_in_T1.nii.gz \
+  --color_sampling_surf white \
+  --num_colors 9 \
+  --output_dir ./coloured_models \
+  --preset pial_brain \
   -v
 ```
 
-### 3  Colour an existing OBJ directly
+*Flags of note*  
+- `--space T1|MNI|sub-XX` - Space for surface generation
+- `--color_in source|target` - Space for coloring (source=T1, target=final space)
+- `--color_sampling_surf white|pial|mid` - Surface to sample colors from
+- `--num_colors N` - Number of discrete color bins
+- `--preset pial_brain|white_brain|mid_brain` - Surface type preset
+
+### 3  Colour an existing OBJ directly
 
 ```bash
 brain_for_printing_color direct \
@@ -103,7 +129,7 @@ brain_for_printing_color direct \
   --out_obj brain_coloured.obj
 ```
 
-### 4  Slice a brain STL into 10 mm axial slabs
+### 4  Slice a brain STL into 10 mm axial slabs
 
 ```bash
 brain_for_printing_slab_slices \
@@ -113,7 +139,7 @@ brain_for_printing_slab_slices \
   --out_dir slabs_out
 ```
 
-### 5  Hollow ventricles
+### 5  Hollow ventricles
 
 ```bash
 brain_for_printing_hollow_ventricles \
@@ -143,7 +169,7 @@ brain_for_printing_hollow_ventricles \
 
 ## License
 
-MIT © Claude J. Bajada and contributors
+MIT © Claude J. Bajada and contributors
 
 ---
 
