@@ -124,8 +124,17 @@ def load_subcortical_and_ventricle_meshes(five_ttgen_persistent_dir_str: str) ->
     result: Dict[str, trimesh.Trimesh] = {}
     five_ttgen_persistent_dir = Path(five_ttgen_persistent_dir_str)
     
-    # Load subcortical meshes
-    for mesh_path in five_ttgen_persistent_dir.glob("subcortical_*.vtk"):
+    # Find the 5ttgen-tmp directory
+    tmp_dirs = list(five_ttgen_persistent_dir.glob("5ttgen-tmp-*"))
+    if not tmp_dirs:
+        L.error(f"No 5ttgen-tmp directory found in {five_ttgen_persistent_dir}")
+        return {}
+    
+    tmp_dir = tmp_dirs[0]
+    L.info(f"Found 5ttgen tmp directory: {tmp_dir}")
+    
+    # Load subcortical meshes (first-*_transformed.vtk)
+    for mesh_path in tmp_dir.glob("first-*_transformed.vtk"):
         try:
             poly_data = _read_vtk_polydata(str(mesh_path), L)
             if poly_data is None:
@@ -136,33 +145,49 @@ def load_subcortical_and_ventricle_meshes(five_ttgen_persistent_dir_str: str) ->
                 continue
                 
             # Get mesh name from filename
-            mesh_name = mesh_path.stem.replace("subcortical_", "")
-            result[mesh_name] = mesh
+            # Convert first-L_Puta_transformed.vtk -> L_Puta
+            mesh_name = mesh_path.stem.replace("first-", "").replace("_transformed", "")
+            result[f"subcortical-{mesh_name}"] = mesh
             L.info(f"Loaded subcortical mesh: {mesh_name}")
             
         except Exception as e:
             L.error(f"Failed to load subcortical mesh {mesh_path}: {e}")
             continue
             
-    # Load ventricle meshes
-    for mesh_path in five_ttgen_persistent_dir.glob("ventricle_*.vtk"):
-        try:
-            poly_data = _read_vtk_polydata(str(mesh_path), L)
-            if poly_data is None:
-                continue
+    # Load ventricle meshes (CSF.vtk, *-Ventricle.vtk, etc.)
+    ventricle_patterns = [
+        "CSF.vtk",
+        "*-Ventricle.vtk",
+        "*_LatVent_ChorPlex.vtk",
+        "*-Inf-Lat-Vent.vtk"
+    ]
+    
+    for pattern in ventricle_patterns:
+        for mesh_path in tmp_dir.glob(pattern):
+            try:
+                poly_data = _read_vtk_polydata(str(mesh_path), L)
+                if poly_data is None:
+                    continue
+                    
+                mesh = _vtk_polydata_to_trimesh(poly_data)
+                if mesh is None or mesh.is_empty:
+                    continue
+                    
+                # Get mesh name from filename
+                # Remove common suffixes and prefixes
+                mesh_name = mesh_path.stem
+                mesh_name = mesh_name.replace("_init", "")
+                mesh_name = mesh_name.replace("_ChorPlex", "")
+                mesh_name = mesh_name.replace("-Inf-Lat-Vent", "")
+                mesh_name = mesh_name.replace("-Ventricle", "")
                 
-            mesh = _vtk_polydata_to_trimesh(poly_data)
-            if mesh is None or mesh.is_empty:
-                continue
+                # Add ventricle prefix
+                result[f"ventricle-{mesh_name}"] = mesh
+                L.info(f"Loaded ventricle mesh: {mesh_name}")
                 
-            # Get mesh name from filename
-            mesh_name = mesh_path.stem.replace("ventricle_", "")
-            result[mesh_name] = mesh
-            L.info(f"Loaded ventricle mesh: {mesh_name}")
-            
-        except Exception as e:
-            L.error(f"Failed to load ventricle mesh {mesh_path}: {e}")
-            continue
+            except Exception as e:
+                L.error(f"Failed to load ventricle mesh {mesh_path}: {e}")
+                continue
             
     return result
 
