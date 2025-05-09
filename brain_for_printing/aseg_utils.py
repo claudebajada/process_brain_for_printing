@@ -135,7 +135,6 @@ def extract_structure_surface(
         aseg_in_target_space = flexible_match(
             base_dir=anat_dir,
             subject_id=subject_id,
-            space=target_space,
             descriptor="aseg",
             suffix="dseg",
             session=session,
@@ -143,23 +142,35 @@ def extract_structure_surface(
             logger=logger,
         )
     except FileNotFoundError:
-        logger.info(f"No fMRIPrep ASEG found for {subject_id}, trying FreeSurfer ASEG...")
+        # Try without space specification
         try:
-            # Try to convert FreeSurfer ASEG to T1w space
-            aseg_in_target_space = convert_fs_aseg_to_t1w(
-                subjects_dir=Path("/home/Archive/TOM/astronaut_data/data_management/preprocess_data/Output"),
+            aseg_in_target_space = flexible_match(
+                base_dir=anat_dir,
                 subject_id=subject_id,
-                output_dir=output_dir,
+                descriptor="aseg",
+                suffix="dseg",
                 session=session,
                 run=run,
-                verbose=verbose,
+                logger=logger,
             )
-            if aseg_in_target_space is None:
-                logger.error(f"Failed to convert FreeSurfer ASEG for {subject_id}")
+        except FileNotFoundError:
+            logger.info(f"No fMRIPrep ASEG found for {subject_id}, trying FreeSurfer ASEG...")
+            try:
+                # Try to convert FreeSurfer ASEG to T1w space
+                aseg_in_target_space = convert_fs_aseg_to_t1w(
+                    subjects_dir=subjects_dir,
+                    subject_id=subject_id,
+                    output_dir=output_dir,
+                    session=session,
+                    run=run,
+                    verbose=verbose,
+                )
+                if aseg_in_target_space is None:
+                    logger.error(f"Failed to convert FreeSurfer ASEG for {subject_id}")
+                    return None
+            except Exception as e:
+                logger.error(f"Failed to convert FreeSurfer ASEG: {str(e)}")
                 return None
-        except Exception as e:
-            logger.error(f"Failed to convert FreeSurfer ASEG: {str(e)}")
-            return None
 
     # Create output directory if needed
     output_dir = Path(output_dir) if output_dir else Path.cwd()
