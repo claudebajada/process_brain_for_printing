@@ -125,7 +125,7 @@ def extract_structure_surface(
         aseg_in_target_space = flexible_match(
             subject_id=subject_id,
             space=target_space,
-            desc="aseg",
+            descriptor="aseg",
             suffix="dseg",
             session=session,
             run=run,
