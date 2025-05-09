@@ -192,7 +192,8 @@ def generate_brain_surfaces(
                 session=session,
                 run=run,
                 verbose=verbose,
-                logger=L
+                logger=L,
+                subjects_dir=subjects_dir,
             )
             
             if gii_path and Path(gii_path).exists():

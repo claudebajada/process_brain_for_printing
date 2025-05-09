@@ -101,6 +101,7 @@ def extract_structure_surface(
     run: Optional[str] = None,
     verbose: bool = False,
     logger: Optional[logging.Logger] = None,
+    subjects_dir: Optional[str] = None,
 ) -> Optional[Path]:
     """Extract surface from ASEG structure in specified space.
 
@@ -113,6 +114,7 @@ def extract_structure_surface(
         run: Run ID (optional)
         verbose: Enable verbose logging
         logger: Logger instance (optional)
+        subjects_dir: Path to subjects directory (required for finding ASEG files)
 
     Returns:
         Path to generated GIFTI file or None if failed
@@ -120,9 +122,18 @@ def extract_structure_surface(
     logger = logger or logging.getLogger(__name__)
     logger.info(f"Locating {target_space}-space aseg for {subject_id} ({structure})")
 
+    if not subjects_dir:
+        logger.error("subjects_dir is required")
+        return None
+
+    # Get the anat directory for this subject
+    subject_id_clean = subject_id.replace('sub-', '')
+    anat_dir = Path(subjects_dir) / f"sub-{subject_id_clean}" / "anat"
+
     # Try to find ASEG in fMRIPrep output first
     try:
         aseg_in_target_space = flexible_match(
+            base_dir=anat_dir,
             subject_id=subject_id,
             space=target_space,
             descriptor="aseg",
