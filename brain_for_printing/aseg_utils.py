@@ -9,6 +9,7 @@ import logging
 from pathlib import Path
 from typing import List, Optional
 import uuid
+import subprocess
 
 from .io_utils import run_cmd, flexible_match
 from .mesh_utils import volume_to_gifti
@@ -201,4 +202,101 @@ def extract_structure_surface(
         return str(output_gii_path)
     except Exception as e:
         L.error(f"NIfTI->GIFTI failed for {output_tag}: {e}", exc_info=verbose)
+        return None
+
+def convert_fs_aseg_to_t1w(
+    subjects_dir: str,
+    subject_id: str,
+    output_dir: str,
+    session: Optional[str] = None,
+    run: Optional[str] = None,
+    verbose: bool = False
+) -> Optional[str]:
+    """
+    Convert FreeSurfer ASEG file to T1w space.
+    
+    Args:
+        subjects_dir: Path to subjects directory
+        subject_id: Subject ID (e.g., 'sub-01')
+        output_dir: Directory to save the converted ASEG file
+        session: BIDS session ID
+        run: BIDS run ID
+        verbose: Enable verbose logging
+        
+    Returns:
+        Optional[str]: Path to the converted ASEG file in T1w space, None if failed
+    """
+    try:
+        # Get paths
+        subject_id_clean = subject_id.replace('sub-', '')
+        fs_subject_dir = Path(subjects_dir) / f"sub-{subject_id_clean}" / "freesurfer"
+        anat_dir = Path(subjects_dir) / f"sub-{subject_id_clean}" / "anat"
+        output_dir_path = Path(output_dir)
+        output_dir_path.mkdir(parents=True, exist_ok=True)
+        
+        # Find FreeSurfer ASEG file
+        aseg_fs = fs_subject_dir / "mri" / "aseg.mgz"
+        if not aseg_fs.exists():
+            L.error(f"FreeSurfer ASEG not found: {aseg_fs}")
+            return None
+            
+        # Find transform file
+        xfm_path = flexible_match(
+            anat_dir,
+            subject_id,
+            descriptor="from-fsnative_to-T1w_mode-image",
+            suffix="xfm",
+            ext=".txt",
+            session=session,
+            run=run,
+            logger=L
+        )
+        
+        # Find T1w reference
+        t1w_ref = flexible_match(
+            anat_dir,
+            subject_id,
+            descriptor="preproc",
+            suffix="T1w",
+            ext=".nii.gz",
+            session=session,
+            run=run,
+            logger=L
+        )
+        
+        # Convert ASEG to NIfTI
+        aseg_nii = output_dir_path / f"{subject_id}_desc-aseg_fsnative.nii.gz"
+        run_cmd([
+            "mri_convert",
+            str(aseg_fs),
+            str(aseg_nii)
+        ], verbose=verbose)
+        
+        # Apply transform to get into T1w space
+        output_filename = f"{subject_id}"
+        if session:
+            output_filename = f"{output_filename}_ses-{session}"
+        output_filename = f"{output_filename}_desc-aseg_dseg.nii.gz"
+        aseg_t1w = output_dir_path / output_filename
+            
+        run_cmd([
+            "antsApplyTransforms",
+            "-d", "3",
+            "-i", str(aseg_nii),
+            "-r", t1w_ref,
+            "-t", xfm_path,
+            "-o", str(aseg_t1w),
+            "-n", "NearestNeighbor"
+        ], verbose=verbose)
+        
+        # Clean up intermediate file
+        aseg_nii.unlink()
+        
+        return str(aseg_t1w)
+        
+    except FileNotFoundError as e:
+        L.error(f"File not found: {e}")
+        return None
+    except Exception as e:
+        L.error(f"Failed to convert ASEG: {e}", exc_info=verbose)
         return None 
