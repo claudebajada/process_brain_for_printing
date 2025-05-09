@@ -223,7 +223,7 @@ def convert_fs_aseg_to_t1w(
     try:
         # Get paths
         subject_id_clean = subject_id.replace('sub-', '')
-        fs_subject_dir = Path(subjects_dir) / f"sub-{subject_id_clean}" / "freesurfer"
+        fs_subject_dir = Path(subjects_dir) / "sourcedata" / "freesurfer" / f"sub-{subject_id_clean}"
         anat_dir = Path(subjects_dir) / f"sub-{subject_id_clean}" / "anat"
         output_dir_path = Path(output_dir)
         output_dir_path.mkdir(parents=True, exist_ok=True)
