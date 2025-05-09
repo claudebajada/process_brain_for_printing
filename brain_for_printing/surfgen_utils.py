@@ -185,15 +185,14 @@ def generate_brain_surfaces(
             labels = STRUCTURE_LABEL_MAP[struct_name]
             L.info(f"Extracting ASEG '{struct_name}' in T1...")
             gii_path = extract_structure_surface(
-                str(subjects_dir_path),
-                subject_id,
-                labels,
-                struct_name,
-                "T1",
-                str(tmp_dir_path),
-                verbose,
-                session,
-                run
+                subject_id=subject_id,
+                structure=struct_name,
+                target_space="T1",
+                output_dir=str(tmp_dir_path),
+                session=session,
+                run=run,
+                verbose=verbose,
+                logger=L
             )
             
             if gii_path and Path(gii_path).exists():
