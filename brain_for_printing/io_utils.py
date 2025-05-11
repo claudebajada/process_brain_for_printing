@@ -56,11 +56,15 @@ def temp_dir(tag: str = "bfp", keep: bool = False, base_dir: Optional[str] = Non
 def first_match(pattern: str, logger=L) -> str:
     logger.debug(f"Searching for pattern: {pattern}")
     matches = glob.glob(pattern)
-    if not matches: logger.error(f"No files found matching: {pattern}"); raise FileNotFoundError(f"No files found matching: {pattern}")
+    if not matches: 
+        logger.info(f"No files found matching: {pattern}")
+        raise FileNotFoundError(f"No files found matching: {pattern}")
     # Sort matches for consistent selection when multiple exist
     matches.sort()
-    if len(matches) > 1: logger.warning(f"Multiple files ({len(matches)}) match '{pattern}'. Using first sorted: {matches[0]}")
-    else: logger.debug(f"Found unique match: {matches[0]}")
+    if len(matches) > 1: 
+        logger.warning(f"Multiple files ({len(matches)}) match '{pattern}'. Using first sorted: {matches[0]}")
+    else: 
+        logger.debug(f"Found unique match: {matches[0]}")
     return matches[0]
 
 def flexible_match(

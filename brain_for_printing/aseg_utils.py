@@ -154,7 +154,7 @@ def extract_structure_surface(
                 logger=logger,
             )
         except FileNotFoundError:
-            logger.info(f"No fMRIPrep ASEG found for {subject_id}, trying FreeSurfer ASEG...")
+            logger.info(f"No fMRIPrep ASEG found in {anat_dir}, falling back to FreeSurfer ASEG...")
             try:
                 # Try to convert FreeSurfer ASEG to T1w space
                 aseg_in_target_space = convert_fs_aseg_to_t1w(
