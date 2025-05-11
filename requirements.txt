@@ -1,7 +1,0 @@
-numpy>=1.20.0
-nibabel>=3.2.0
-trimesh>=3.9.0
-vtk>=9.0.0
-pytest>=7.0.0
-pytest-cov>=4.0.0
-pytest-mock>=3.10.0 
