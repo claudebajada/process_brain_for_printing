@@ -17,7 +17,7 @@ import numpy as np
 from typing import Dict, Optional, List, Set, Tuple, Union
 
 # --- Local Imports ---
-from .io_utils import temp_dir, require_cmds, flexible_match
+from .io_utils import temp_dir, require_cmds, flexible_match, validate_subject_data
 from .log_utils import get_logger, write_log
 from .surfaces import generate_brain_surfaces, run_5ttgen_hsvs_save_temp_bids, load_subcortical_and_ventricle_meshes
 from . import constants as const
