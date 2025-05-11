@@ -19,7 +19,12 @@ from typing import Dict, Optional, List, Set, Tuple, Union
 # --- Local Imports ---
 from .io_utils import temp_dir, require_cmds, flexible_match, validate_subject_data
 from .log_utils import get_logger, write_log
-from .surfaces import generate_brain_surfaces, run_5ttgen_hsvs_save_temp_bids, load_subcortical_and_ventricle_meshes
+from .surfaces import (
+    generate_brain_surfaces, 
+    run_5ttgen_hsvs_save_temp_bids, 
+    load_subcortical_and_ventricle_meshes,
+    export_surfaces
+)
 from . import constants as const
 from .config_utils import PRESETS, parse_preset
 # --- End Imports ---
@@ -128,20 +133,29 @@ def main():
         output_dir = Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         
+        # Parse surface requests based on mode
+        if args.mode == "custom":
+            base_cortical_needed, cbm_bs_cc_needed, exact_mesh_keys = parse_custom_surface_args(
+                args.cortical_surfaces if hasattr(args, 'cortical_surfaces') else [],
+                args.cbm_bs_cc if hasattr(args, 'cbm_bs_cc') else []
+            )
+        else:  # preset mode
+            base_cortical_needed, cbm_bs_cc_needed, exact_mesh_keys = parse_preset(args.name)
+            
         # Generate surfaces
         surfaces = generate_brain_surfaces(
             subjects_dir=args.subjects_dir,
             subject_id=args.subject_id,
             space=args.space,
-            surfaces=args.surfaces,
-            extract_structures=args.extract_structures,
+            surfaces=tuple(base_cortical_needed),
+            extract_structures=list(cbm_bs_cc_needed),
             no_fill_structures=args.no_fill_structures,
             no_smooth_structures=args.no_smooth_structures,
             run=args.run,
             session=args.session,
             verbose=args.verbose,
-            tmp_dir=args.tmp_dir,
-            preloaded_vtk_meshes=args.preloaded_vtk_meshes
+            tmp_dir=args.work_dir,
+            preloaded_vtk_meshes={}  # TODO: Add VTK mesh handling if needed
         )
         
         if not surfaces:
@@ -154,7 +168,7 @@ def main():
             output_dir=output_dir,
             subject_id=args.subject_id,
             space=args.space,
-            preset=args.preset,
+            preset=args.name if args.mode == "preset" else None,
             verbose=args.verbose
         )
         
