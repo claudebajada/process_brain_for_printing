@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
+import signal
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable, Optional, Union, List
@@ -21,14 +22,94 @@ import logging
 
 L = logging.getLogger(__name__)
 
+# Global flag for graceful exit
+_should_exit = False
+
+def _signal_handler(signum, frame):
+    """Handle interrupt signals gracefully."""
+    global _should_exit
+    if _should_exit:
+        L.warning("Force exit requested. Terminating...")
+        sys.exit(1)
+    L.info("\nGracefully shutting down... (Press Ctrl+C again to force exit)")
+    _should_exit = True
+
+# Register signal handlers
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
+
+def check_should_exit() -> bool:
+    """Check if a graceful exit was requested."""
+    return _should_exit
+
+def validate_subject_data(subjects_dir: Union[str, Path], subject_id: str, required_files: Optional[List[str]] = None) -> bool:
+    """
+    Validate that required files exist for a subject.
+    
+    Args:
+        subjects_dir: Path to subjects directory
+        subject_id: Subject ID
+        required_files: List of required file patterns to check
+        
+    Returns:
+        bool: True if all required files exist, False otherwise
+    """
+    subjects_dir = Path(subjects_dir)
+    subject_dir = subjects_dir / f"sub-{subject_id.replace('sub-', '')}"
+    
+    if not subject_dir.exists():
+        L.error(f"Subject directory not found: {subject_dir}")
+        return False
+        
+    if not required_files:
+        # Default required files
+        required_files = [
+            "anat/*T1w.nii.gz",  # T1w image
+            "sourcedata/freesurfer/sub-*/mri/aseg.mgz"  # FreeSurfer ASEG
+        ]
+    
+    missing_files = []
+    for pattern in required_files:
+        matches = list(subject_dir.glob(pattern))
+        if not matches:
+            missing_files.append(pattern)
+            
+    if missing_files:
+        L.error(f"Missing required files for subject {subject_id}:")
+        for file in missing_files:
+            L.error(f"  - {file}")
+        return False
+        
+    return True
+
 # --- External-process helpers ---
 def run_cmd(cmd: List[str], verbose: bool = False) -> None:
-    try: process = subprocess.run( cmd, check=True, stdout=None if verbose else subprocess.PIPE, stderr=None if verbose else subprocess.PIPE, text=True, )
+    try:
+        if check_should_exit():
+            raise KeyboardInterrupt("Graceful exit requested")
+            
+        process = subprocess.run(
+            cmd,
+            check=True,
+            stdout=None if verbose else subprocess.PIPE,
+            stderr=None if verbose else subprocess.PIPE,
+            text=True,
+        )
     except subprocess.CalledProcessError as exc:
-        err_msg = exc.stderr if hasattr(exc, 'stderr') and exc.stderr else "<no stderr captured>"; out_msg = exc.stdout if hasattr(exc, 'stdout') and exc.stdout else "<no stdout captured>"; combined_msg = f"Stderr:\n{err_msg}\nStdout:\n{out_msg}"
-        L.error(f"Cmd failed (Code {exc.returncode}): {' '.join(cmd)}\n{combined_msg}"); raise RuntimeError(f"Cmd failed: {' '.join(cmd)}. See logs.") from exc
-    except FileNotFoundError: L.error(f"Cmd not found: '{cmd[0]}'."); raise
-    except Exception as e: L.error(f"Unexpected error running: {' '.join(cmd)}\n{e}", exc_info=verbose); raise
+        err_msg = exc.stderr if hasattr(exc, 'stderr') and exc.stderr else "<no stderr captured>"
+        out_msg = exc.stdout if hasattr(exc, 'stdout') and exc.stdout else "<no stdout captured>"
+        combined_msg = f"Stderr:\n{err_msg}\nStdout:\n{out_msg}"
+        L.error(f"Cmd failed (Code {exc.returncode}): {' '.join(cmd)}\n{combined_msg}")
+        raise RuntimeError(f"Cmd failed: {' '.join(cmd)}. See logs.") from exc
+    except FileNotFoundError:
+        L.error(f"Cmd not found: '{cmd[0]}'.")
+        raise
+    except KeyboardInterrupt:
+        L.info("Command interrupted by user")
+        raise
+    except Exception as e:
+        L.error(f"Unexpected error running: {' '.join(cmd)}\n{e}", exc_info=verbose)
+        raise
 
 def require_cmd(cmd: str, url_hint: str | None = None, logger=L) -> Path:
     path = shutil.which(cmd)
