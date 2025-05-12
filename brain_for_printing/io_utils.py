@@ -60,7 +60,7 @@ def validate_subject_data(subjects_dir: Union[str, Path], subject_id: str, requi
     if not required_files:
         # Default required files
         required_files = [
-            "anat/*T1w.nii.gz",  # T1w image
+            f"sub-{subject_id}/anat/*T1w.nii.gz",  # T1w image
             f"sourcedata/freesurfer/sub-{subject_id}/mri/aseg.mgz"  # FreeSurfer ASEG
         ]
     
