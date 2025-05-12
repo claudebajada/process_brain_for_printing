@@ -6,6 +6,9 @@ import nibabel as nib
 import trimesh
 from skimage import measure
 from trimesh.remesh import subdivide_to_size
+import logging # Added import
+
+L = logging.getLogger(__name__) # Added logger instance
 
 def gifti_to_trimesh(gifti_file):
     """
@@ -21,13 +24,14 @@ def volume_to_gifti(nifti_file, out_gifti, level=0.5):
     """
     Convert a binary mask (NIfTI) into a GIFTI surface mesh via marching_cubes.
     """
-    print(f"[INFO] Running marching_cubes on: {os.path.basename(nifti_file)}")
+    # MODIFIED: Use logger
+    L.info(f"Running marching_cubes on: {os.path.basename(nifti_file)}")
     nii = nib.load(nifti_file)
     vol = nii.get_fdata()
     affine = nii.affine
 
     verts_vox, faces, _, _ = measure.marching_cubes(
-        volume=vol, 
+        volume=vol,
         level=level,
         allow_degenerate=False
     )
@@ -52,8 +56,9 @@ def volume_to_gifti(nifti_file, out_gifti, level=0.5):
     )
     gii.darrays.extend([coords_da, faces_da])
     nib.save(gii, out_gifti)
-    print(f"[INFO] Saved GIFTI => {os.path.basename(out_gifti)}")
-    
+    # MODIFIED: Use logger
+    L.info(f"Saved GIFTI => {os.path.basename(out_gifti)}")
+
 def voxel_remesh_and_repair(
     mesh: trimesh.Trimesh,
     pitch: float = 0.5,
@@ -87,9 +92,9 @@ def voxel_remesh_and_repair(
     if do_smooth:
         # Apply Taubin smoothing to reduce stair-stepping
         trimesh.smoothing.filter_taubin(
-            remeshed, 
-            lamb=0.5, 
-            nu=-0.53, 
+            remeshed,
+            lamb=0.5,
+            nu=-0.53,
             iterations=smooth_iterations
         )
 
@@ -209,4 +214,3 @@ def _build_slab_box(bounds, orientation, lower, upper):
         )
         box_extents = (x_size, y_size, z_size)
     return box_center, box_extents
-

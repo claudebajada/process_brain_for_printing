@@ -19,18 +19,20 @@ from typing import List, Dict, Set, Tuple, Optional
 
 # --- Local Imports ---
 from .io_utils import temp_dir, flexible_match
+# MODIFIED: Import get_logger
 from .log_utils import get_logger, write_log
 from .color_utils import project_param_to_surface, copy_vertex_colors
 from .mesh_utils import gifti_to_trimesh
 from .warp_utils import create_mrtrix_warp, warp_gifti_vertices
 # Import surface generation function
+# Note: surfaces.py re-exports generate_brain_surfaces
 from .surfaces import generate_brain_surfaces
 # Import shared constants and preset utilities
 from . import constants as const
 from .config_utils import PRESETS, parse_preset
 # --- End Imports ---
 
-L = logging.getLogger("brain_for_printing_color")
+# L = logging.getLogger("brain_for_printing_color") # Let main configure it
 
 # Map surface type arguments to BIDS suffixes
 SURF_ARG_TO_BIDS_SUFFIX = {
@@ -73,8 +75,8 @@ def _build_parser() -> argparse.ArgumentParser:
     preset_parser.add_argument("--subjects_dir", required=True, help="Main BIDS derivatives directory (e.g., /path/to/bids/derivatives).")
     preset_parser.add_argument("--subject_id", required=True, help="Subject ID (e.g., sub-CB).")
     preset_parser.add_argument("--preset", required=True, choices=list(PRESETS.keys()), help="Name of the surface generation preset to use.")
-    preset_parser.add_argument("--space", 
-                             default="T1", 
+    preset_parser.add_argument("--space",
+                             default="T1",
                              help="Space for surface generation: 'T1' (native), 'MNI' (template), or target subject ID (e.g., 'sub-01') to warp into that subject's T1 space.")
     preset_parser.add_argument("--color_in",
                              required=True,
@@ -101,7 +103,7 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 # --------------------------------------------------------------------------- #
-# Mode implementations (No changes needed in the core logic below this point)
+# Mode implementations
 # --------------------------------------------------------------------------- #
 def _run_direct(args, logger) -> None:
     """Executes the 'direct' coloring subcommand."""
@@ -227,7 +229,7 @@ def _run_preset(args, logger) -> None:
                             source_mesh = source_meshes.get(key)
                             if source_mesh is None or source_mesh.is_empty:
                                 raise ValueError(f"Source mesh for {key} not found or empty")
-                            
+
                             if use_cross_sampling:
                                 sampling_bids_suffix = SURF_ARG_TO_BIDS_SUFFIX.get(sampling_surf_type_arg)
                                 if not sampling_bids_suffix: raise ValueError(f"Invalid --color_sampling_surf '{sampling_surf_type_arg}'")
@@ -250,7 +252,7 @@ def _run_preset(args, logger) -> None:
                             else:
                                 logger.debug(f"Coloring source mesh {key} directly...")
                                 project_param_to_surface(mesh=source_mesh, param_nifti_path=args.param_map, num_colors=args.num_colors, order=args.order, threshold=args.param_threshold)
-                            
+
                             # Copy colors from source to target mesh
                             if len(source_mesh.vertices) != len(target_mesh.vertices): raise ValueError(f"Vertex count mismatch between source ({len(source_mesh.vertices)}) and target ({len(target_mesh.vertices)})")
                             copy_vertex_colors(source_mesh, target_mesh)
@@ -261,7 +263,7 @@ def _run_preset(args, logger) -> None:
                                 sampling_bids_suffix = SURF_ARG_TO_BIDS_SUFFIX.get(sampling_surf_type_arg)
                                 if not sampling_bids_suffix: raise ValueError(f"Invalid --color_sampling_surf '{sampling_surf_type_arg}'")
                                 logger.debug(f"Finding sampling surface: hemi={target_hemi}, suffix={sampling_bids_suffix}")
-                                
+
                                 # Get the sampling surface in T1 space
                                 sampling_gii_path_str = flexible_match(base_dir=anat_dir, subject_id=f"sub-{subject_label_clean}", suffix=f"{sampling_bids_suffix}.surf", hemi=f"hemi-{target_hemi}", ext=".gii", run=args.run, session=args.session)
                                 sampling_gii_path = Path(sampling_gii_path_str)
@@ -278,7 +280,7 @@ def _run_preset(args, logger) -> None:
                                     logger.debug(f"Found MNI reference: {Path(mni_ref).name}")
                                     mni_to_t1_xfm = flexible_match(anat_dir, f"sub-{subject_label_clean}", descriptor="from-MNI152NLin2009cAsym_to-T1w_mode-image", suffix="xfm", ext=".h5", session=args.session, run=args.run, logger=logger)
                                     logger.debug(f"Found MNI->T1 transform: {Path(mni_to_t1_xfm).name}")
-                                    
+
                                     # Create the warp field only once
                                     t1_to_mni_warp = Path(tmp) / f"warp_sampling_{sampling_surf_type_arg}_T1w-to-MNI.nii.gz"
                                     if not t1_to_mni_warp.exists():
@@ -286,16 +288,16 @@ def _run_preset(args, logger) -> None:
                                         create_mrtrix_warp(str(mni_ref), str(t1_prep), str(mni_to_t1_xfm), str(t1_to_mni_warp), str(tmp), args.verbose)
                                     else:
                                         logger.info(f"Using existing warp field: {t1_to_mni_warp.name}")
-                                    
+
                                     # Warp the sampling surface to MNI
                                     sampling_mni_gii = Path(tmp) / f"sampling_{sampling_surf_type_arg}_{target_hemi}_space-MNI.gii"
                                     logger.info(f"Warping sampling surface to MNI: {sampling_mni_gii.name}")
                                     warp_gifti_vertices(str(sampling_gii_path), str(t1_to_mni_warp), str(sampling_mni_gii), args.verbose)
-                                    
+
                                     # Verify the warped file exists
                                     if not sampling_mni_gii.exists():
                                         raise FileNotFoundError(f"Failed to create warped sampling surface: {sampling_mni_gii}")
-                                    
+
                                     # Update the path to use the warped surface
                                     old_path = sampling_gii_path
                                     sampling_gii_path = sampling_mni_gii
@@ -305,7 +307,7 @@ def _run_preset(args, logger) -> None:
                                 logger.debug(f"Loading sampling mesh: {sampling_gii_path.name}")
                                 sampling_mesh = gifti_to_trimesh(str(sampling_gii_path))
                                 if sampling_mesh.is_empty: raise ValueError(f"Sampling mesh {sampling_gii_path.name} is empty.")
-                                
+
                                 # Log vertex counts for debugging
                                 logger.debug(f"Sampling mesh vertices: {len(sampling_mesh.vertices)}")
                                 logger.debug(f"Target mesh vertices: {len(target_mesh.vertices)}")
@@ -314,7 +316,7 @@ def _run_preset(args, logger) -> None:
                                 project_param_to_surface(mesh=sampling_mesh, param_nifti_path=args.param_map, num_colors=args.num_colors, order=args.order, threshold=args.param_threshold)
 
                                 logger.debug(f"Copying colors from sampling mesh to target mesh ({key})...")
-                                if len(sampling_mesh.vertices) != len(target_mesh.vertices): 
+                                if len(sampling_mesh.vertices) != len(target_mesh.vertices):
                                     logger.error(f"Vertex count mismatch: sampling={len(sampling_mesh.vertices)}, target={len(target_mesh.vertices)}")
                                     raise ValueError(f"Vertex count mismatch between sampling ({len(sampling_mesh.vertices)}) and target ({len(target_mesh.vertices)})")
                                 copy_vertex_colors(sampling_mesh, target_mesh)
@@ -322,7 +324,7 @@ def _run_preset(args, logger) -> None:
                                 logger.debug(f"Coloring target mesh {key} directly...")
                                 project_param_to_surface(mesh=target_mesh, param_nifti_path=args.param_map, num_colors=args.num_colors, order=args.order, threshold=args.param_threshold)
                             runlog["steps"].append(f"Applied coloring directly to {key} in target space")
-                        
+
                         colored_keys.append(key)
                     except Exception as e_color:
                         logger.warning(f"Failed process/color component {key}: {e_color}", exc_info=args.verbose)
@@ -374,10 +376,12 @@ def _run_preset(args, logger) -> None:
 # --------------------------------------------------------------------------- #
 def main() -> None:
     args = _build_parser().parse_args()
+    # MODIFIED: Use get_logger for setup
     log_level = logging.INFO if args.verbose else logging.WARNING
-    L.setLevel(log_level)
-    logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s - [%(name)s] %(message)s', force=True)
+    L = get_logger("brain_for_printing_color", level=log_level) # Configure logger using the utility
+    # logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s - [%(name)s] %(message)s', force=True) # Removed this line
 
+    # Pass logger L to sub-functions
     if args.subcommand == "direct":
         _run_direct(args, L)
     elif args.subcommand == "preset":

@@ -5,8 +5,11 @@ import nibabel as nib
 from scipy.ndimage import map_coordinates
 import matplotlib
 import trimesh
+import logging # Added import
 
 from .mesh_utils import gifti_to_trimesh
+
+L = logging.getLogger(__name__) # Added logger instance
 
 def project_param_to_surface(
     mesh: trimesh.Trimesh,
@@ -92,7 +95,8 @@ def color_pial_from_midthickness(
     2) Project param map (optionally with threshold)
     3) Copy color to pial surface (1:1 vertex match)
     """
-    print(f"[INFO] color_pial_from_midthickness => {pial_mesh_file}")
+    # MODIFIED: Use logger
+    L.info(f"color_pial_from_midthickness => {pial_mesh_file}")
     mid_mesh = gifti_to_trimesh(mid_mesh_file)
 
     # Now pass 'threshold' to project_param_to_surface if provided
@@ -119,8 +123,8 @@ def copy_vertex_colors(mesh_source, mesh_target):
     if len(mesh_source.vertices) != len(mesh_target.vertices):
         raise ValueError("Meshes do not have matching vertex counts!")
     mesh_target.visual.vertex_colors = mesh_source.visual.vertex_colors.copy()
-    
-    
+
+
 def color_mesh_with_seg_and_param(mesh, segmentation_img, seg_affine,
                                   param_img=None, param_affine=None,
                                   threshold=0.0, num_colors=6):
@@ -185,5 +189,3 @@ def color_mesh_with_seg_and_param(mesh, segmentation_img, seg_affine,
 
     mesh.visual.vertex_colors = base_colors
     return mesh
-
-
