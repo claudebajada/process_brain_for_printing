@@ -55,22 +55,19 @@ def validate_subject_data(subjects_dir: Union[str, Path], subject_id: str, requi
         bool: True if all required files exist, False otherwise
     """
     subjects_dir = Path(subjects_dir)
-    subject_dir = subjects_dir / f"sub-{subject_id.replace('sub-', '')}"
+    subject_id = subject_id.replace('sub-', '')
     
-    if not subject_dir.exists():
-        L.error(f"Subject directory not found: {subject_dir}")
-        return False
-        
     if not required_files:
         # Default required files
         required_files = [
             "anat/*T1w.nii.gz",  # T1w image
-            "sourcedata/freesurfer/sub-*/mri/aseg.mgz"  # FreeSurfer ASEG
+            f"sourcedata/freesurfer/sub-{subject_id}/mri/aseg.mgz"  # FreeSurfer ASEG
         ]
     
     missing_files = []
     for pattern in required_files:
-        matches = list(subject_dir.glob(pattern))
+        # Try both relative to subjects_dir and absolute path
+        matches = list(subjects_dir.glob(pattern))
         if not matches:
             missing_files.append(pattern)
             
