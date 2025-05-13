@@ -181,8 +181,9 @@ def run_5ttgen_hsvs_save_temp_bids(
     if sgm_amyg_hipp: 
         cmd.append("-sgm_amyg_hipp")
     
-    cmd.extend(["-tempdir", str(work_dir_path)])
-    cmd.append("-force") # *** ADDED -force FLAG ***
+    cmd.extend(["-scratch", str(work_dir_path)])
+    cmd.append("-nocleanup")
+    cmd.append("-force") 
     
     L.info(f"Running 5ttgen command: {' '.join(cmd)}")
     try:
