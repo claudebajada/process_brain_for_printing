@@ -229,9 +229,10 @@ def run_5ttgen_hsvs_save_temp_bids(
     if sgm_amyg_hipp: 
         cmd.append("-sgm_amyg_hipp")
     
-    # Critical: -tempdir tells 5ttgen where to put its '5ttgen-tmp-XXXXXX' folder,
+    # Critical: -scratch tells 5ttgen where to put its '5ttgen-tmp-XXXXXX' folder,
     # which is the one containing the VTK files.
     cmd.extend(["-scratch", str(work_dir_path)])
+    cmd.extend(["-nocleanup"])
     
     L.info(f"Running 5ttgen command: {' '.join(cmd)}")
     try:
