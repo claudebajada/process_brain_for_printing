@@ -22,6 +22,7 @@ PRESETS: Dict[str, List[str]] = {
     "cortical_pial": ['lh-pial', 'corpus_callosum', 'rh-pial'],
     "cortical_white": ['lh-white', 'corpus_callosum', 'rh-white'],
     "cortical_mid": ['lh-mid', 'corpus_callosum', 'rh-mid'],
+    "brain_mask_surface": ["brain_mask_indicator"], # New preset
     # Add other presets as needed
 }
 
@@ -49,6 +50,13 @@ def parse_preset(preset_name: str) -> Tuple[Set[str], Set[str], List[str]]:
     base_cortical_needed: Set[str] = set()
     other_structures_needed: Set[str] = set()
     exact_mesh_keys: List[str] = []
+
+    # Handle special indicator for brain_mask_surface preset
+    if preset_name == "brain_mask_surface" and preset_list == ["brain_mask_indicator"]:
+        # This preset is handled differently in the CLI, no standard parsing needed here.
+        # exact_mesh_keys can be set to indicate what the CLI should expect, e.g. ["brain_mask"]
+        exact_mesh_keys.append("brain_mask")
+        return base_cortical_needed, other_structures_needed, exact_mesh_keys
 
     for item in preset_list:
         # Check if it's an ASEG/CBM/BS/CC structure
