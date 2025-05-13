@@ -10,7 +10,7 @@ import uuid
 import logging
 import tempfile
 from pathlib import Path
-from typing import List, Tuple, Dict, Optional, Union
+from typing import List, Tuple, Dict, Optional, Union, Set
 import sys
 
 import trimesh
@@ -22,6 +22,7 @@ from .mesh_utils import gifti_to_trimesh
 from .warp_utils import create_mrtrix_warp, warp_gifti_vertices
 from . import constants as const
 from .aseg_utils import extract_structure_surface
+from .aseg_utils import convert_fs_aseg_to_t1w
 
 L = logging.getLogger(__name__)
 
@@ -143,10 +144,10 @@ def generate_brain_surfaces(
         for k in preloaded_vtk_meshes:
             result[k] = None
             
-    # Step 1: Gather T1 surfaces
+    # === Step 1: Gather T1 Native Space Surfaces and Structures ===
     L.info(f"--- Step 1: Gathering T1 surfaces for {subject_id} ---")
     try:
-        # Get cortical surfaces
+        # --- Locate T1 Cortical Surfaces
         for surf_type in processed_surf_types:
             suffix = SURF_NAME_MAP[surf_type]
             L.debug(f"Locating T1 {surf_type} ({suffix})")
@@ -180,56 +181,104 @@ def generate_brain_surfaces(
                 L.critical(f"Missing T1 FS surf: {e}")
                 raise
                 
-        # Get ASEG structures
-        for struct_name in extract_structures:
-            labels = STRUCTURE_LABEL_MAP[struct_name]
-            L.info(f"Extracting ASEG '{struct_name}' in T1...")
-            gii_path = extract_structure_surface(
-                subject_id=subject_id,
-                structure=struct_name,
-                target_space="T1",
-                output_dir=str(tmp_dir_path),
-                session=session,
-                run=run,
-                verbose=verbose,
-                logger=L,
-                subjects_dir=subjects_dir,
-            )
+        # --- Locate ASEG file ONCE before the loop ---
+        aseg_t1_file_path = None # Variable to store the located ASEG file path
+        if extract_structures: # Only search for ASEG if structures are requested
+            L.info("Locating T1-space segmentation file for structure extraction...")
+            try:
+                # Try finding fmriprep output first (preferred)
+                aseg_t1_file_path = flexible_match(
+                    base_dir=source_anat_dir, subject_id=subject_id,
+                    # Consider adding space='T1w' if that's standard, otherwise omit for flexibility
+                    # space="T1w", # Example: Explicitly look for T1w space if possible
+                    descriptor="aseg", suffix="dseg", ext=".nii.gz",
+                    session=session, run=run, logger=L )
+                L.info(f"  Using fMRIPrep ASEG: {Path(aseg_t1_file_path).name}")
+            except FileNotFoundError:
+                # If not found, try finding without explicit space T1w (might be native)
+                 try:
+                      aseg_t1_file_path = flexible_match(
+                          base_dir=source_anat_dir, subject_id=subject_id,
+                          descriptor="aseg", suffix="dseg", ext=".nii.gz",
+                          session=session, run=run, logger=L )
+                      L.info(f"  Using fMRIPrep native-space ASEG: {Path(aseg_t1_file_path).name}")
+                 except FileNotFoundError:
+                    L.info("  fMRIPrep ASEG not found. Attempting to convert FreeSurfer aseg.mgz to T1w space...")
+                    try:
+                        # Use tmp_dir_path which is defined earlier
+                        aseg_t1_file_path_obj = convert_fs_aseg_to_t1w(
+                            subjects_dir=str(subjects_dir_path), # Pass full path
+                            subject_id=subject_id,
+                            output_dir=str(tmp_dir_path), # Use temp dir for output
+                            session=session, run=run, verbose=verbose )
+                        if aseg_t1_file_path_obj:
+                            aseg_t1_file_path = str(aseg_t1_file_path_obj)
+                            L.info(f"  Successfully converted FS aseg.mgz to T1w: {Path(aseg_t1_file_path).name}")
+                        else:
+                            # Raise an error here if conversion fails but structures were requested
+                            raise RuntimeError("Failed to convert FreeSurfer aseg.mgz, cannot extract structures.")
+                    except Exception as e_convert:
+                        L.critical(f"Failed to find or convert an ASEG file in T1 space: {e_convert}")
+                        # Decide how to handle: raise error or just warn and skip structures?
+                        # Raising error is safer if structures are critical.
+                        raise RuntimeError("No suitable ASEG file found for structure extraction.") from e_convert
+
+            # If no ASEG file could be found/created, but structures were requested, raise error
+            if not aseg_t1_file_path:
+                 raise RuntimeError("ASEG file required but not found or generated.")
+
+
+        # --- Generate T1 ASEG Structures ---
+        # MODIFIED: Loop uses the pre-found aseg_t1_file_path
+        if aseg_t1_file_path: # Proceed only if we successfully found the ASEG file
+             for struct_name in extract_structures:
+                L.info(f"Extracting ASEG structure '{struct_name}' from: {Path(aseg_t1_file_path).name}")
+                # MODIFIED: Pass aseg_file_path to the function
+                gii_path = extract_structure_surface(
+                    structure=struct_name,
+                    output_dir=str(tmp_dir_path),
+                    aseg_file_path=aseg_t1_file_path, # Pass the found path
+                    subject_id=subject_id, # Still needed for output filename
+                    target_space="T1",     # Indicate space for filename
+                    verbose=verbose,
+                    logger=L
+                )
+
             
-            if gii_path and Path(gii_path).exists():
-                L.debug(f"ASEG {struct_name} GIFTI: {Path(gii_path).name}")
-                try:
-                    mesh = gifti_to_trimesh(gii_path)
-                except Exception as e:
-                    L.warning(f"Load {struct_name} GIFTI fail: {e}")
-                    continue
+                if gii_path and Path(gii_path).exists():
+                    L.debug(f"ASEG {struct_name} GIFTI: {Path(gii_path).name}")
+                    try:
+                        mesh = gifti_to_trimesh(gii_path)
+                    except Exception as e:
+                        L.warning(f"Load {struct_name} GIFTI fail: {e}")
+                        continue
                     
-                if mesh.is_empty:
-                    L.warning(f"ASEG {struct_name} empty.")
-                    continue
+                    if mesh.is_empty:
+                        L.warning(f"ASEG {struct_name} empty.")
+                        continue
+                        
+                    if struct_name not in no_fill_structures:
+                        L.debug(f"Filling {struct_name}")
+                        trimesh.repair.fill_holes(mesh)
                     
-                if struct_name not in no_fill_structures:
-                    L.debug(f"Filling {struct_name}")
-                    trimesh.repair.fill_holes(mesh)
+                    if struct_name not in no_smooth_structures:
+                        L.debug(f"Smoothing {struct_name}")
+                        trimesh.smoothing.filter_taubin(mesh, lamb=0.5, nu=-0.53, iterations=10)
                     
-                if struct_name not in no_smooth_structures:
-                    L.debug(f"Smoothing {struct_name}")
-                    trimesh.smoothing.filter_taubin(mesh, lamb=0.5, nu=-0.53, iterations=10)
-                    
-                mesh.fix_normals()
-                source_t1_meshes[struct_name] = mesh
-                L.info(f"Processed ASEG {struct_name} -> Trimesh.")
-            else:
-                L.warning(f"Failed generate GIFTI for ASEG {struct_name} in T1.")
-                
+                    mesh.fix_normals()
+                    source_t1_meshes[struct_name] = mesh
+                    L.info(f"Processed ASEG {struct_name} -> Trimesh.")
+                else:
+                    L.warning(f"  Failed to generate GIFTI surface for ASEG structure '{struct_name}'.")
+
     except FileNotFoundError as e:
-        L.critical(f"Failed find critical T1 source: {e}")
+        L.critical(f"Failed to find essential T1 source file: {e}")
         sys.exit(1)
     except Exception as e:
-        L.error(f"Error Step 1: {e}", exc_info=verbose)
+        L.error(f"Unexpected error during Step 1 (T1 surface gathering): {e}", exc_info=verbose)
         sys.exit(1)
-        
-    L.info(f"--- Step 1 Done ({len(source_t1_gifti_paths)} cortical paths, {len(source_t1_meshes)} ASEG) ---")
+
+    L.info(f"--- Step 1 Done: {len(source_t1_gifti_paths)} cortical paths, {len(source_t1_meshes)} structure meshes ---")
     
     # Step 2: Process for target space
     L.info(f"--- Step 2: Processing for target space: {space_mode} ---")

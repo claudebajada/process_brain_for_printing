@@ -7,11 +7,14 @@ Logging helpers + JSON run‑log writer.
 from __future__ import annotations
 import datetime
 import json
-import logging
+import logging # Make sure logging is imported
 import os
 import platform
 import subprocess
 from pathlib import Path
+
+# MODIFIED: Add logger instance
+L = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------- #
 # Real‑time logger
@@ -54,10 +57,13 @@ def write_log(log_dict: dict, output_dir: str | os.PathLike, base_name="run_log"
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True, parents=True)
     log_path = output_dir / f"{base_name}_{timestamp}.json"
-    with open(log_path, "w") as f:
-        json.dump(log_dict, f, indent=2)
-
-    print(f"[INFO] JSON log written ⇒ {log_path}")
+    try: # Added try/except for file writing
+        with open(log_path, "w") as f:
+            json.dump(log_dict, f, indent=2)
+        # MODIFIED: Changed print to L.info
+        L.info(f"JSON log written => {log_path}")
+    except Exception as e:
+        L.error(f"Failed to write JSON log to {log_path}: {e}")
 
 
 def _get_system_info() -> dict:
@@ -72,12 +78,35 @@ def _get_system_info() -> dict:
 
 def _get_git_commit_hash() -> str | None:
     try:
+        # Try getting hash from current directory (if it's the repo root or subdir)
+        script_dir = Path(__file__).parent
         result = subprocess.run(
             ["git", "rev-parse", "HEAD"],
             capture_output=True,
             text=True,
-            check=True,
+            check=False, # Don't raise error if not a git repo or no HEAD
+            cwd=script_dir # Check relative to script location first
         )
-        return result.stdout.strip()
-    except Exception:
+        if result.returncode == 0:
+            return result.stdout.strip()
+
+        # If failed, try checking from the CWD (might be different from script dir)
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False, # Don't raise error
+            cwd=Path.cwd() # Check relative to current working directory
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+
+    except FileNotFoundError: # Handle case where git command is not found
+         L.debug("Git command not found, cannot get commit hash.")
+         return None
+    except Exception as e:
+        L.debug(f"Could not get git commit hash: {e}")
         return None
+    
+    L.debug("Could not determine git commit hash.")
+    return None # Explicitly return None if hash couldn't be found
