@@ -9,136 +9,105 @@ import logging
 from pathlib import Path
 from typing import List, Optional
 import uuid
-import subprocess
+# import subprocess # Not directly used in _extract_structure_mask_t1 if run_cmd is used
 
-from .io_utils import run_cmd, flexible_match
+from .io_utils import run_cmd, flexible_match # flexible_match might not be needed here
 from .mesh_utils import volume_to_gifti
+from . import constants as const # Import constants to access label definitions
 
 L = logging.getLogger(__name__)
 
+# Define a more comprehensive map at module level or ensure it's used in _extract_structure_mask_t1
+ASEG_STRUCTURE_TO_LABELS = {
+    "brainstem": const.BRAINSTEM_LABEL,
+    "cerebellum_cortex": const.CEREBELLUM_CORTEX_LABELS,
+    "cerebellum_wm": const.CEREBELLUM_WM_LABELS,
+    "cerebellum": const.CEREBELLUM_LABELS, # Combined cerebellum
+    "corpus_callosum": const.CORPUS_CALLOSUM_LABELS,
+}
+
 def _extract_structure_mask_t1(
     aseg_file: str,
-    structure: str,
+    structure: str, # This 'structure' name must be a key in ASEG_STRUCTURE_TO_LABELS
     output_file: Path,
     verbose: bool = False,
     logger: Optional[logging.Logger] = None,
 ) -> bool:
-    """Extract binary mask for a structure from ASEG file.
-
-    Args:
-        aseg_file: Path to ASEG file
-        structure: Structure name (e.g., 'brainstem', 'cerebellum')
-        output_file: Path to output mask file
-        verbose: Enable verbose logging
-        logger: Logger instance (optional)
-
-    Returns:
-        bool: True if successful, False otherwise
-    """
-    logger = logger or logging.getLogger(__name__)
+    """Extract binary mask for a structure from ASEG file."""
+    logger = logger or L # Use provided or module logger
     
-    # Map structure names to label IDs
-    structure_labels = {
-        'brainstem': [16],  # Brain Stem
-        'cerebellum': [7, 8, 46, 47],  # Left/Right Cerebellum Cortex
-        'corpus_callosum': [251, 252, 253, 254, 255],  # Corpus Callosum
-    }
-    
-    if structure not in structure_labels:
-        logger.error(f"Unknown structure: {structure}")
+    if structure not in ASEG_STRUCTURE_TO_LABELS:
+        logger.error(f"Unknown structure for ASEG mask extraction: '{structure}'. Known structures are: {list(ASEG_STRUCTURE_TO_LABELS.keys())}")
         return False
         
-    label_ids = structure_labels[structure]
+    label_ids = ASEG_STRUCTURE_TO_LABELS[structure]
+    if not label_ids: # Should not happen if constants are defined
+        logger.error(f"Label IDs for structure '{structure}' are empty or undefined. Cannot extract mask.")
+        return False
+    
+    logger.debug(f"Extracting mask for '{structure}' using labels {label_ids} from {Path(aseg_file).name} into {output_file.name}")
     
     try:
-        # Use mri_binarize to extract mask
         cmd = [
             "mri_binarize",
             "--i", aseg_file,
             "--o", str(output_file),
             "--match", *[str(label) for label in label_ids],
         ]
-        run_cmd(cmd, verbose=verbose)
+        run_cmd(cmd, verbose=verbose) # run_cmd should raise an error if mri_binarize fails
+        if not output_file.exists() or output_file.stat().st_size == 0:
+            logger.error(f"mri_binarize command ran for '{structure}' but output file {output_file} was not created or is empty.")
+            return False
+        logger.info(f"Successfully created binary mask for '{structure}': {output_file.name}")
         return True
     except Exception as e:
-        logger.error(f"Failed to extract mask: {str(e)}")
+        logger.error(f"Failed to extract mask for '{structure}': {e}", exc_info=verbose)
         return False
 
 def _generate_surface_from_mask(
     mask_file: Path,
     output_file: Path,
-    verbose: bool = False,
+    verbose: bool = False, # verbose not directly used by volume_to_gifti but good to keep consistent
     logger: Optional[logging.Logger] = None,
 ) -> bool:
-    """Generate surface from binary mask.
-
-    Args:
-        mask_file: Path to binary mask file
-        output_file: Path to output GIFTI surface file
-        verbose: Enable verbose logging
-        logger: Logger instance (optional)
-
-    Returns:
-        bool: True if successful, False otherwise
-    """
-    logger = logger or logging.getLogger(__name__)
+    """Generate surface from binary mask."""
+    logger = logger or L
     
     try:
-        # Convert NIfTI to GIFTI using marching cubes
+        # volume_to_gifti logs its own success/failure related to saving
         volume_to_gifti(str(mask_file), str(output_file), level=0.5)
-        logger.info(f"Created GIFTI: {output_file.name}")
+        if not output_file.exists() or output_file.stat().st_size == 0:
+             logger.error(f"volume_to_gifti seemed to run for mask '{mask_file.name}' but output GIFTI {output_file} was not created or is empty.")
+             return False
+        # The info log "Created GIFTI" is now inside volume_to_gifti.
         return True
     except Exception as e:
-        logger.error(f"Failed to generate surface: {str(e)}")
+        logger.error(f"Failed to generate surface from mask '{mask_file.name}': {e}", exc_info=verbose)
         return False
 
 def extract_structure_surface(
     structure: str,
     output_dir: str,
-    # --- Inputs ---
-    aseg_file_path: Optional[str] = None, # Input: Path to the specific ASEG file
-    subject_id: Optional[str] = None,     # Input: Used for output naming convention
-    target_space: str = "T1",             # Input: Used for output naming convention
-    # --- Options ---
+    aseg_file_path: Optional[str] = None, 
+    subject_id: Optional[str] = None,     
+    target_space: str = "T1",             
     verbose: bool = False,
     logger: Optional[logging.Logger] = None,
-    # --- Removed inputs no longer needed for search ---
-    # session: Optional[str] = None,
-    # run: Optional[str] = None,
-    # subjects_dir: Optional[str] = None,
 ) -> Optional[Path]:
-    """Extracts a surface mesh for a specified anatomical structure from a given ASEG segmentation file.
-
-    Args:
-        structure: Name of the structure to extract (e.g., 'brainstem').
-        output_dir: Directory where intermediate mask and final GIFTI file will be saved.
-        aseg_file_path: Optional. The specific ASEG file (.nii.gz or .mgz) to use.
-                        If None, the function will log an error and return None.
-        subject_id: Optional. Subject ID (e.g., 'sub-01'). Used for naming output files.
-        target_space: Optional. String indicating the space (e.g., 'T1'). Used for naming.
-        verbose: Enable detailed logging.
-        logger: Optional logger instance.
-
-    Returns:
-        Optional[Path]: Path object to the generated GIFTI surface file if successful, None otherwise.
-    """
-    logger = logger or L # Use provided logger or module logger
+    """Extracts a surface mesh for a specified anatomical structure from a given ASEG segmentation file."""
+    logger = logger or L 
     logger.info(f"--- Starting surface extraction for structure: '{structure}' ---")
 
-    # --- Check if aseg_file_path is provided ---
     if not aseg_file_path:
         logger.error("ASEG file path was not provided to extract_structure_surface. Cannot proceed.")
         return None
 
-    aseg_in_target_space = Path(aseg_file_path) # Convert to Path object
+    aseg_in_target_space = Path(aseg_file_path)
     logger.info(f"Using provided ASEG file: {aseg_in_target_space}")
     if not aseg_in_target_space.exists():
          logger.error(f"Provided ASEG file not found: {aseg_in_target_space}")
          return None
-    # --- End Check ---
 
-
-    # --- Create output directory ---
     try:
         output_dir_path = Path(output_dir)
         output_dir_path.mkdir(parents=True, exist_ok=True)
@@ -147,24 +116,18 @@ def extract_structure_surface(
         logger.error(f"Failed to create output directory {output_dir}: {e}")
         return None
 
-
-    # --- Define output filenames ---
-    # Use a unique ID to prevent clashes if called multiple times quickly
     unique_id = uuid.uuid4().hex[:6]
-    # Base filename includes subject ID if available, otherwise just structure/space
     fname_prefix = f"{subject_id}_" if subject_id else ""
-    # Use the helper function names exactly as defined in your file
-    structure_mask_file = output_dir_path / f"{fname_prefix}space-{target_space}_desc-{structure}_mask_{unique_id}.nii.gz"
-    final_surface_file = output_dir_path / f"{fname_prefix}space-{target_space}_desc-{structure}_surface_{unique_id}.gii"
+    
+    # Use a more descriptive name for the mask file if possible
+    safe_structure_name = structure.replace("_", "-") # Basic sanitization for filename
+    structure_mask_file = output_dir_path / f"{fname_prefix}space-{target_space}_desc-{safe_structure_name}_mask_{unique_id}.nii.gz"
+    final_surface_file = output_dir_path / f"{fname_prefix}space-{target_space}_desc-{safe_structure_name}_surface_{unique_id}.gii"
 
-
-    # --- Step 1: Generate binary mask for the structure ---
     logger.info(f"Step 1: Extracting binary mask for '{structure}'...")
-    # Use the validated aseg_in_target_space path
-    # Ensure the helper function name matches your file (_extract_structure_mask_t1 or _extract_structure_mask_from_file)
     mask_ok = _extract_structure_mask_t1(
-        aseg_file=str(aseg_in_target_space), # Pass the validated path string
-        structure=structure,
+        aseg_file=str(aseg_in_target_space), 
+        structure=structure, # This 'structure' name must be a key in ASEG_STRUCTURE_TO_LABELS
         output_file=structure_mask_file,
         verbose=verbose,
         logger=logger,
@@ -172,26 +135,23 @@ def extract_structure_surface(
 
     if not mask_ok:
         logger.error(f"Failed to create binary mask for '{structure}'. Aborting extraction.")
-        structure_mask_file.unlink(missing_ok=True) # Attempt cleanup
+        structure_mask_file.unlink(missing_ok=True) 
         return None
 
-
-    # --- Step 2: Generate surface from the mask ---
     logger.info(f"Step 2: Generating GIFTI surface from mask '{structure_mask_file.name}'...")
     surface_ok = _generate_surface_from_mask(
         mask_file=structure_mask_file,
         output_file=final_surface_file,
-        verbose=verbose, # Pass verbose along
+        verbose=verbose, 
         logger=logger,
     )
 
-    # --- Cleanup intermediate mask file ---
     logger.debug(f"Cleaning up intermediate mask file: {structure_mask_file.name}")
-    structure_mask_file.unlink(missing_ok=True) # Delete mask regardless of surface success
+    structure_mask_file.unlink(missing_ok=True) 
 
     if not surface_ok:
         logger.error(f"Failed to generate surface for '{structure}'.")
-        final_surface_file.unlink(missing_ok=True) # Attempt cleanup
+        final_surface_file.unlink(missing_ok=True) 
         return None
 
     logger.info(f"--- Successfully extracted surface for '{structure}' => {final_surface_file.name} ---")
@@ -199,7 +159,7 @@ def extract_structure_surface(
 
 
 def convert_fs_aseg_to_t1w(
-    subjects_dir: str,
+    subjects_dir: str, # This should be the top-level BIDS derivatives dir
     subject_id: str,
     output_dir: str,
     session: Optional[str] = None,
@@ -207,50 +167,40 @@ def convert_fs_aseg_to_t1w(
     verbose: bool = False
 ) -> Optional[str]:
     """
-    Convert FreeSurfer ASEG file to T1w space.
-    
-    Args:
-        subjects_dir: Path to subjects directory
-        subject_id: Subject ID (e.g., 'sub-01')
-        output_dir: Directory to save the converted ASEG file
-        session: BIDS session ID
-        run: BIDS run ID
-        verbose: Enable verbose logging
-        
-    Returns:
-        Optional[str]: Path to the converted ASEG file in T1w space, None if failed
+    Convert FreeSurfer ASEG file (aseg.mgz expected in sourcedata/freesurfer) to T1w space.
     """
     try:
-        # Get paths
         subject_id_clean = subject_id.replace('sub-', '')
-        fs_subject_dir = Path(subjects_dir) / "sourcedata" / "freesurfer" / f"sub-{subject_id_clean}"
-        anat_dir = Path(subjects_dir) / f"sub-{subject_id_clean}" / "anat"
+        # Path to sourcedata/freesurfer within the BIDS derivatives subjects_dir
+        fs_sourcedata_dir = Path(subjects_dir) / "sourcedata" / "freesurfer" / f"sub-{subject_id_clean}"
+        # Path to subject's anat directory in BIDS derivatives
+        bids_anat_dir = Path(subjects_dir) / subject_id / "anat"
+        
         output_dir_path = Path(output_dir)
         output_dir_path.mkdir(parents=True, exist_ok=True)
         
-        # Find FreeSurfer ASEG file
-        aseg_fs = fs_subject_dir / "mri" / "aseg.mgz"
-        if not aseg_fs.exists():
-            L.error(f"FreeSurfer ASEG not found: {aseg_fs}")
+        aseg_fs_mgz = fs_sourcedata_dir / "mri" / "aseg.mgz"
+        if not aseg_fs_mgz.exists():
+            L.error(f"FreeSurfer aseg.mgz not found at expected location: {aseg_fs_mgz}")
             return None
             
-        # Find transform file
-        xfm_path = flexible_match(
-            anat_dir,
-            subject_id,
-            descriptor="from-fsnative_to-T1w_mode-image",
+        # Transform is from fsnative to T1w (usually found in subject's anat dir from fmriprep)
+        xfm_fsnative_to_t1w_path = flexible_match(
+            bids_anat_dir,
+            subject_id, # Pass full subject_id like "sub-XYZ"
+            descriptor="from-fsnative_to-T1w_mode-image", # Common descriptor from fmriprep
             suffix="xfm",
-            ext=".txt",
+            ext=".txt", # Often .txt for LTA transforms usable by mri_vol2vol or ANTs
             session=session,
             run=run,
             logger=L
         )
         
-        # Find T1w reference
-        t1w_ref = flexible_match(
-            anat_dir,
+        # T1w reference image (usually preprocessed T1w in subject's anat)
+        t1w_ref_image = flexible_match(
+            bids_anat_dir,
             subject_id,
-            descriptor="preproc",
+            descriptor="preproc", # Or other appropriate descriptor for your reference T1w
             suffix="T1w",
             ext=".nii.gz",
             session=session,
@@ -258,39 +208,47 @@ def convert_fs_aseg_to_t1w(
             logger=L
         )
         
-        # Convert ASEG to NIfTI
-        aseg_nii = output_dir_path / f"{subject_id}_desc-aseg_fsnative.nii.gz"
+        # Intermediate NIfTI from aseg.mgz (in fsnative space)
+        aseg_fsnative_nii = output_dir_path / f"{subject_id}_desc-aseg_fromFS_fsnative.nii.gz"
         run_cmd([
-            "mri_convert",
-            str(aseg_fs),
-            str(aseg_nii)
+            "mri_convert", str(aseg_fs_mgz), str(aseg_fsnative_nii)
         ], verbose=verbose)
         
-        # Apply transform to get into T1w space
-        output_filename = f"{subject_id}"
-        if session:
-            output_filename = f"{output_filename}_ses-{session}"
-        output_filename = f"{output_filename}_desc-aseg_dseg.nii.gz"
-        aseg_t1w = output_dir_path / output_filename
+        # Final output: aseg in T1w space
+        output_filename_t1w = f"{subject_id}"
+        if session: output_filename_t1w += f"_ses-{session.replace('ses-','')}"
+        if run: output_filename_t1w += f"_run-{run.replace('run-','')}" # Ensure run is cleaned if needed
+        output_filename_t1w += "_space-T1w_desc-aseg_dseg.nii.gz" # BIDS compliant name
+        
+        aseg_final_t1w_path = output_dir_path / output_filename_t1w
             
+        # Use antsApplyTransforms for robust application of .txt (ITK format) or .h5 transforms
+        # If xfm_fsnative_to_t1w_path is an LTA, it might need conversion or mri_vol2vol
+        # Assuming xfm_path is compatible with antsApplyTransforms (e.g. .h5 or .mat from ANTs)
+        # If it's an LTA (.lta or .txt LTA), mri_vol2vol would be more direct:
+        # mri_vol2vol --mov aseg_fsnative_nii --targ t1w_ref_image --lta xfm_fsnative_to_t1w_path --o aseg_final_t1w_path --nearest
+        # For now, assuming ANTs compatible transform as per previous structure:
         run_cmd([
             "antsApplyTransforms",
             "-d", "3",
-            "-i", str(aseg_nii),
-            "-r", t1w_ref,
-            "-t", xfm_path,
-            "-o", str(aseg_t1w),
-            "-n", "NearestNeighbor"
+            "-i", str(aseg_fsnative_nii),
+            "-r", str(t1w_ref_image),
+            "-t", str(xfm_fsnative_to_t1w_path),
+            "-o", str(aseg_final_t1w_path),
+            "-n", "GenericLabel" # Use GenericLabel or MultiLabel for segmentations
         ], verbose=verbose)
         
-        # Clean up intermediate file
-        aseg_nii.unlink()
+        aseg_fsnative_nii.unlink(missing_ok=True) # Clean up intermediate
         
-        return str(aseg_t1w)
+        if aseg_final_t1w_path.exists():
+            return str(aseg_final_t1w_path)
+        else:
+            L.error(f"Failed to create ASEG in T1w space at {aseg_final_t1w_path}")
+            return None
         
     except FileNotFoundError as e:
-        L.error(f"File not found: {e}")
+        L.error(f"File not found during ASEG to T1w conversion: {e}")
         return None
     except Exception as e:
-        L.error(f"Failed to convert ASEG: {e}", exc_info=verbose)
-        return None 
+        L.error(f"Failed to convert ASEG to T1w: {e}", exc_info=verbose)
+        return None

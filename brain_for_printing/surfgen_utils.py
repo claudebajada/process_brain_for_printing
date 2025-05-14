@@ -63,6 +63,7 @@ def generate_single_brain_mask_surface(
     logger.info(f"--- Starting brain mask surface generation for {subject_id} in {space} space ---")
     logger.info(f"Parameters: inflate_mm={inflate_mm}, no_smooth={no_smooth}")
     tmp_path = Path(tmp_dir) 
+    tmp_path.mkdir(parents=True, exist_ok=True) # Ensure work sub-directory exists
 
     try:
         anat_dir = Path(subjects_dir) / subject_id / "anat"
@@ -71,7 +72,7 @@ def generate_single_brain_mask_surface(
             return None
 
         logger.info("Locating T1w brain mask...")
-        mask_file_t1 = flexible_match(
+        mask_file_t1_str = flexible_match(
             base_dir=anat_dir,
             subject_id=subject_id,
             descriptor="desc-brain",
@@ -83,38 +84,38 @@ def generate_single_brain_mask_surface(
         )
         logger.info(f"Found T1w brain mask: {mask_file_t1}")
 
-        final_mask_path = Path(mask_file_t1)
+        final_mask_path = Path(mask_file_t1_str)
 
         if space.upper() == "MNI":
             logger.info("Warping brain mask to MNI space...")
             require_cmd("antsApplyTransforms", "https://github.com/ANTsX/ANTs", logger=logger)
 
-            xfm_t1_to_mni = flexible_match(
+            xfm_t1_to_mni_str = flexible_match(
                 anat_dir, subject_id,
                 descriptor="from-T1w_to-MNI152NLin2009cAsym_mode-image",
                 suffix="xfm", session=session, run=run, ext=".h5", logger=logger
             )
-            mni_template_ref = flexible_match(
+            mni_template_ref_str = flexible_match(
                 anat_dir, subject_id, 
                 space="MNI152NLin2009cAsym",
                 suffix="T1w", 
                 session=session, run=run, ext=".nii.gz", logger=logger
             )
-            logger.info(f"Using T1w-to-MNI transform: {xfm_t1_to_mni}")
-            logger.info(f"Using MNI template reference: {mni_template_ref}")
+            logger.info(f"Using T1w-to-MNI transform: {xfm_t1_to_mni_str}")
+            logger.info(f"Using MNI template reference: {mni_template_ref_str}")
 
-            warped_mask_mni = tmp_path / f"{subject_id}_space-MNI_desc-brain_mask.nii.gz"
+            warped_mask_mni_path = tmp_path / f"{subject_id}_space-MNI_desc-brain_mask.nii.gz"
             cmd_warp = [
                 "antsApplyTransforms", "-d", "3",
-                "-i", str(mask_file_t1),
-                "-o", str(warped_mask_mni),
-                "-r", str(mni_template_ref),
-                "-t", str(xfm_t1_to_mni),
+                "-i", str(final_mask_path),
+                "-o", str(warped_mask_mni_path),
+                "-r", str(mni_template_ref_str),
+                "-t", str(xfm_t1_to_mni_str),
                 "-n", "NearestNeighbor"
             ]
             run_cmd(cmd_warp, verbose=verbose)
-            logger.info(f"Mask warped to MNI: {warped_mask_mni}")
-            final_mask_path = warped_mask_mni
+            logger.info(f"Mask warped to MNI: {warped_mask_mni_path}")
+            final_mask_path = warped_mask_mni_path
         elif space.upper() != "T1":
             logger.error(f"Unsupported space for brain mask generation: {space}. Only T1 or MNI.")
             return None
@@ -143,13 +144,29 @@ def generate_single_brain_mask_surface(
 
 
         logger.info(f"Converting mask '{final_mask_path.name}' to GIFTI surface...")
+        
+        # Construct GIFTI path
         gii_surface_path = tmp_path / f"{Path(final_mask_path).stem}.surf.gii"
+        
+        # Call volume_to_gifti
         volume_to_gifti(str(final_mask_path), str(gii_surface_path), level=0.5)
+
+        # *** ADDED CHECK for file existence ***
+        if not gii_surface_path.exists() or gii_surface_path.stat().st_size == 0:
+            logger.error(f"volume_to_gifti failed to create or created an empty output: {gii_surface_path}")
+            try:
+                mask_img_check = nib.load(str(final_mask_path))
+                if np.sum(mask_img_check.get_fdata()) == 0:
+                    logger.error(f"The input mask '{final_mask_path.name}' to volume_to_gifti was empty.")
+            except Exception as e_load_mask:
+                logger.error(f"Could not load input mask {final_mask_path.name} to verify if empty: {e_load_mask}")
+            return None # Critical failure if GIFTI not created
+
         logger.info(f"GIFTI surface created: {gii_surface_path}")
 
         mesh = gifti_to_trimesh(str(gii_surface_path))
         if mesh.is_empty:
-            logger.warning("Generated mesh is empty.")
+            logger.warning(f"Generated mesh from {gii_surface_path.name} is empty or failed to load. Check volume_to_gifti step.") 
             return None
 
         if not no_smooth:
@@ -167,13 +184,13 @@ def generate_single_brain_mask_surface(
         return mesh
 
     except FileNotFoundError as e:
-        logger.error(f"File not found during brain mask generation: {e}")
+        logger.error(f"Essential file not found for brain mask generation: {e}")
         return None
     except RuntimeError as e: 
-        logger.error(f"Command execution failed: {e}")
+        logger.error(f"Command execution failed during brain mask generation: {e}")
         return None
     except Exception as e:
-        logger.error(f"An unexpected error occurred: {e}", exc_info=verbose)
+        logger.error(f"An unexpected error occurred during brain mask surface generation: {e}", exc_info=verbose)
         return None
 
 
@@ -221,16 +238,22 @@ def generate_brain_surfaces(
     if no_smooth_structures is None:
         no_smooth_structures = []
         
-    STRUCTURE_LABEL_MAP = {
+    STRUCTURE_LABEL_MAP_INTERNAL = { # This map is for generate_brain_surfaces itself
         "brainstem": const.BRAINSTEM_LABEL,
         "cerebellum_wm": const.CEREBELLUM_WM_LABELS,
         "cerebellum_cortex": const.CEREBELLUM_CORTEX_LABELS,
-        "cerebellum": const.CEREBELLUM_LABELS,
+        "cerebellum": const.CEREBELLUM_LABELS, # This will be handled by specific call if needed
         "corpus_callosum": const.CORPUS_CALLOSUM_LABELS,
     }
-    valid_extract_structures = [s for s in extract_structures if s in STRUCTURE_LABEL_MAP]
-    if len(valid_extract_structures) != len(extract_structures):
-        L.warning(f"Ignoring unknown extract_structures: {set(extract_structures) - set(valid_extract_structures)}")
+    
+    # Validate extract_structures against THIS map
+    valid_extract_structures_for_aseg = []
+    for s_name in extract_structures:
+        if s_name in STRUCTURE_LABEL_MAP_INTERNAL:
+            valid_extract_structures_for_aseg.append(s_name)
+        else:
+            L.warning(f"Structure '{s_name}' not directly known by generate_brain_surfaces's ASEG map. Will be skipped if it relies on aseg_utils.extract_structure_surface with this exact name.")
+    
     extract_structures = valid_extract_structures
     
     SURF_NAME_MAP = {
