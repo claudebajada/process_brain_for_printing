@@ -38,34 +38,50 @@ from .volumetric_utils import (
 )
 
 # --- Module-Level Helper Functions ---
+
 def get_global_bounds(meshes: List[trimesh.Trimesh]) -> Optional[np.ndarray]:
-    if not meshes: return None
+    """Computes the overall bounding box for a list of meshes."""
+    if not meshes:
+        return None
     valid_meshes = [m for m in meshes if m is not None and not m.is_empty and hasattr(m, 'vertices')]
-    if not valid_meshes: return None
+    if not valid_meshes:
+        return None
+        
     all_verts = np.vstack([m.vertices for m in valid_meshes])
-    if all_verts.shape[0] == 0: return None
+    if all_verts.shape[0] == 0:
+        return None
     return np.array([np.min(all_verts, axis=0), np.max(all_verts, axis=0)])
 
 def create_slab_definition_boxes(global_bounds: np.ndarray, slab_thickness: float, orientation_axis_idx: int, logger: logging.Logger) -> List[trimesh.primitives.Box]:
+    """
+    Creates a list of trimesh.primitives.Box objects representing each slab's spatial extent.
+    """
     slab_boxes = []
     min_coord_slice_axis = global_bounds[0, orientation_axis_idx]
     max_coord_slice_axis = global_bounds[1, orientation_axis_idx]
+    
     current_pos = min_coord_slice_axis
     slab_count = 0
     while current_pos < max_coord_slice_axis:
         slab_top = min(current_pos + slab_thickness, max_coord_slice_axis)
-        if slab_top <= current_pos: 
-            logger.debug(f"Slab top {slab_top} not greater than current_pos {current_pos}. Stopping.")
+        if slab_top <= current_pos + 1e-6: # Add epsilon for float comparison
+            logger.debug(f"Slab top {slab_top} not sufficiently greater than current_pos {current_pos}. Stopping slab creation.")
             break
+
         box_min = global_bounds[0].copy()
         box_max = global_bounds[1].copy()
+        
         box_min[orientation_axis_idx] = current_pos
         box_max[orientation_axis_idx] = slab_top
+        
         slab_extents = box_max - box_min
-        if np.any(slab_extents <= 1e-6): # Use a small epsilon for float comparison
+        if np.any(slab_extents <= 1e-6): # Check for non-positive extents with tolerance
             logger.warning(f"Skipping slab {slab_count} due to zero or near-zero extents: {slab_extents}")
             current_pos = slab_top
+            if np.isclose(current_pos, max_coord_slice_axis) or current_pos > max_coord_slice_axis:
+                break
             continue
+
         slab_center = (box_min + box_max) / 2.0
         try:
             slab_box = trimesh.creation.box(extents=slab_extents, 
@@ -73,14 +89,17 @@ def create_slab_definition_boxes(global_bounds: np.ndarray, slab_thickness: floa
             slab_boxes.append(slab_box)
             logger.debug(f"Created slab def box {slab_count}: center={slab_center}, extents={slab_extents}")
             slab_count +=1
-        except Exception as e_box:
+        except Exception as e_box: 
             logger.error(f"Error creating slab definition box {slab_count} (center: {slab_center}, extents: {slab_extents}): {e_box}")
+
         current_pos = slab_top
         if np.isclose(current_pos, max_coord_slice_axis) or current_pos > max_coord_slice_axis :
             break
+            
     return slab_boxes
 
 def vol_to_mesh(volume_path: Path, output_mesh_path: Path, no_smooth: bool, logger: logging.Logger) -> bool:
+    """Converts a NIFTI volume to a Trimesh mesh, optionally smooths, and saves as STL."""
     logger.info(f"Converting volume {volume_path.name} to mesh {output_mesh_path.name}")
     try:
         img_check = nib.load(str(volume_path))
@@ -90,39 +109,50 @@ def vol_to_mesh(volume_path: Path, output_mesh_path: Path, no_smooth: bool, logg
     except Exception as e:
         logger.error(f"Could not load volume {volume_path.name} to check if empty: {e}")
         return False
+
     temp_gii_path = volume_path.with_name(f"{volume_path.stem}_{os.urandom(4).hex()}.surf.gii")
+    
+    mesh = None # Initialize mesh to None
     try:
         volume_to_gifti(str(volume_path), str(temp_gii_path), level=0.5) 
-        mesh = None
-        if temp_gii_path.exists():
+        if temp_gii_path.exists(): # Check if GIFTI was created before trying to load
             mesh = gifti_to_trimesh(str(temp_gii_path))
+        else:
+            logger.warning(f"GIFTI file {temp_gii_path.name} was not created from {volume_path.name}.")
+            
     except Exception as e_vtg:
         logger.error(f"volume_to_gifti or gifti_to_trimesh failed for {volume_path.name}: {e_vtg}")
-        mesh = None
     finally:
         if temp_gii_path.exists(): 
             temp_gii_path.unlink(missing_ok=True)
+
     if mesh is None or mesh.is_empty:
         logger.warning(f"Mesh from {volume_path.name} is empty or failed to load/convert.")
         return False
+    
     try:
-        if not mesh.is_watertight: # Only fill if not watertight
+        if not mesh.is_watertight:
             mesh = mesh.fill_holes() 
             logger.debug(f"Performed fill_holes on {output_mesh_path.name}.")
     except Exception as e_fill:
         logger.warning(f"Attempting to fill_holes on {output_mesh_path.name} failed: {e_fill}. Proceeding.")
+
     if not no_smooth:
         logger.info(f"Smoothing {output_mesh_path.name}...")
         try:
             mesh_smooth = trimesh.smoothing.filter_taubin(mesh, iterations=10)
-            if mesh_smooth and not mesh_smooth.is_empty: mesh = mesh_smooth
-            else: logger.warning(f"Taubin smoothing resulted in empty/invalid mesh. Using original.")
+            if mesh_smooth and not mesh_smooth.is_empty: 
+                 mesh = mesh_smooth
+            else: 
+                 logger.warning(f"Taubin smoothing resulted in an empty or invalid mesh for {output_mesh_path.name}. Using original mesh.")
         except Exception as e_smooth: 
             logger.warning(f"Taubin smoothing failed for {output_mesh_path.name}: {e_smooth}. Using unsmoothed.")
+
     try:
         mesh.fix_normals(multibody=True) 
     except Exception as e_norm:
-        logger.warning(f"Fixing normals failed for {output_mesh_path.name}: {e_norm}.")
+        logger.warning(f"Fixing normals failed for {output_mesh_path.name}: {e_norm}. Mesh might have issues.")
+
     try:
         output_mesh_path.parent.mkdir(parents=True, exist_ok=True)
         mesh.export(str(output_mesh_path))
@@ -132,6 +162,7 @@ def vol_to_mesh(volume_path: Path, output_mesh_path: Path, no_smooth: bool, logg
         logger.error(f"Failed to export mesh {output_mesh_path}: {e_export}")
         return False
 
+# --- Argument Parser ---
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Generate multi-material brain slab components for 3D printing.",
                                      formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -140,23 +171,29 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output_dir", default="./multi_material_slabs", 
                         help="Base output directory for final STL components and intermediate slab volumes.")
     parser.add_argument("--work_dir", default=None, 
-                        help="Directory for all intermediate files. If None, a temporary one is created under output_dir.")
+                        help="Directory for all intermediate files (surface generation, 5ttgen, voxelization). If None, a temporary one is created under output_dir.")
     parser.add_argument("--session", default=None, help="BIDS session entity.")
     parser.add_argument("--run", default=None, help="BIDS run entity.")
+    
     parser.add_argument("--slab_thickness", type=float, default=5.0, help="Thickness of each slab in mm.")
     parser.add_argument("--slab_orientation", choices=["axial", "coronal", "sagittal"], default="axial", 
                         help="Orientation for slicing.")
+    
     parser.add_argument("--voxel_resolution", type=float, default=0.5, 
-                        help="Voxel size (mm) for high-resolution grid operations.")
+                        help="Voxel size (mm) for the high-resolution grid for voxelization and volumetric operations.")
     parser.add_argument("--no_final_mesh_smoothing", action="store_true", 
-                        help="Disable Taubin smoothing on final component STLs.")
+                        help="Disable Taubin smoothing on the final component meshes (STLs).")
+    
     parser.add_argument("--skip_outer_csf", action="store_true", help="Skip generation of the outer CSF component.")
-    parser.add_argument("--pv_threshold", type=float, default=0.5, help="Threshold for binarizing partial volume images.")
-    parser.add_argument("--no_clean", action="store_true", help="Keep work directory if temporary.")
+    parser.add_argument("--pv_threshold", type=float, default=0.5, help="Threshold for binarizing partial volume images from mesh2voxel.")
+
+    parser.add_argument("--no_clean", action="store_true", help="Keep work directory if it was temporary.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable detailed logging.")
     return parser
 
+# --- Main Workflow ---
 def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_output_base_dir: Path, runlog: Dict[str, Any]):
+    """Main workflow logic."""
     runlog["steps"].append("Starting multi-material slab component generation.")
     L.info(f"Target voxel resolution for operations: {args.voxel_resolution} mm")
     L.info(f"Slab thickness: {args.slab_thickness}mm, Orientation: {args.slab_orientation}")
@@ -205,7 +242,9 @@ def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_out
     white_other_explicit = set()
     for item in white_other_for_complex:
         if item == "cerebellum_wm": white_other_explicit.add("cerebellum_wm") 
-        elif item == "cerebellum": L.warning("'cerebellum' found in white_brain preset components, should be 'cerebellum_wm'. Assuming 'cerebellum_wm'."); white_other_explicit.add("cerebellum_wm")
+        elif item == "cerebellum": 
+            L.warning("'cerebellum' found in white_brain preset components, using 'cerebellum_wm'.")
+            white_other_explicit.add("cerebellum_wm")
         else: white_other_explicit.add(item)
     white_comp_meshes = generate_brain_surfaces(
         args.subjects_dir, args.subject_id, "T1", 
@@ -227,7 +266,10 @@ def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_out
     else: L.warning("VTK not available, skipping SGM/Ventricles.")
     
     valid_parent_meshes_trimesh = {k:v for k,v in parent_meshes_trimesh.items() if v and not v.is_empty}
-    if not valid_parent_meshes_trimesh: L.error("No valid parent Trimesh surfaces generated. Aborting."); return False
+    if not valid_parent_meshes_trimesh: 
+        L.error("No valid parent Trimesh surfaces generated. Aborting.")
+        runlog["warnings"].append("No parent Trimesh surfaces generated.")
+        return False
     L.info(f"Generated {len(valid_parent_meshes_trimesh)} initial parent Trimesh surfaces: {list(valid_parent_meshes_trimesh.keys())}")
     runlog["steps"].append(f"Generated {len(valid_parent_meshes_trimesh)} parent Trimesh surfaces.")
 
@@ -235,43 +277,60 @@ def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_out
     for name, mesh_obj in valid_parent_meshes_trimesh.items():
         safe_name = name.replace("_", "-").replace(" ", "-")
         f_path = temp_parent_mesh_files_dir / f"{args.subject_id}_desc-{safe_name}_parent.obj"
-        try: mesh_obj.export(str(f_path))
+        try:
+            mesh_obj.export(str(f_path))
             parent_mesh_files[name] = f_path
-        except Exception as e_export: L.error(f"Failed to export parent mesh {name} to {f_path}: {e_export}")
-    if not parent_mesh_files: L.error("Failed to export any parent meshes to files. Aborting."); return False
+        except Exception as e_export:
+            L.error(f"Failed to export parent mesh {name} to {f_path}: {e_export}")
+    
+    if not parent_mesh_files: 
+        L.error("Failed to export any parent meshes to files. Aborting.")
+        runlog["warnings"].append("Failed to export parent meshes.")
+        return False
 
     L.info(f"--- Step 2: Defining slab geometry from global bounds ---")
     orientation_map = {"axial": 2, "coronal": 1, "sagittal": 0} 
     slice_axis_idx = orientation_map[args.slab_orientation]
-    all_meshes_for_bounds_list = list(v for v in valid_parent_meshes_trimesh.values() if v is not None) # Ensure list of Trimesh
+    all_meshes_for_bounds_list = list(v for v in valid_parent_meshes_trimesh.values() if v is not None) 
     global_bounds_np_arr = get_global_bounds(all_meshes_for_bounds_list) 
-    if global_bounds_np_arr is None: L.error("Could not determine global bounds. Aborting."); return False
+    if global_bounds_np_arr is None: 
+        L.error("Could not determine global bounds for slicing. Aborting.")
+        runlog["warnings"].append("Failed to get global bounds for slicing.")
+        return False
     L.info(f"Global bounds for slicing: Min={global_bounds_np_arr[0]}, Max={global_bounds_np_arr[1]}")
     slab_definition_boxes_list = create_slab_definition_boxes(global_bounds_np_arr, args.slab_thickness, slice_axis_idx, L) 
     num_slabs = len(slab_definition_boxes_list)
-    L.info(f"Defined {num_slabs} slab intervals.")
-    if num_slabs == 0: L.error("No slab intervals. Check thickness/bounds."); return False
+    L.info(f"Defined {num_slabs} slab intervals based on global bounds.")
+    if num_slabs == 0: 
+        L.error("No slab intervals defined. Check slab thickness and mesh bounds. Aborting.")
+        runlog["warnings"].append("No slab intervals defined.")
+        return False
     runlog["num_slabs"] = num_slabs
 
     L.info(f"--- Step 3: Preparing high-resolution template ({args.voxel_resolution}mm) ---")
-    t1w_native_image_path_str: Optional[str] = None # Initialize
+    t1w_native_image_path_str: Optional[str] = None 
     try:
-        t1w_native_image_path_str = flexible_match( # Returns str
+        t1w_native_image_path_str = flexible_match( 
             base_dir=(Path(args.subjects_dir) / args.subject_id / "anat"), 
             subject_id=args.subject_id, descriptor="preproc", suffix="T1w", ext=".nii.gz",
             session=args.session, run=args.run, logger=L )
     except FileNotFoundError:
-        L.error(f"T1w preproc image not found for {args.subject_id}. Cannot create voxelization template."); return False
+        L.error(f"T1w preproc image not found for {args.subject_id}. Cannot create voxelization template.")
+        runlog["warnings"].append(f"T1w preproc for template not found for {args.subject_id}")
+        return False
     
     high_res_template_path = work_dir / f"{args.subject_id}_template_hires_{args.voxel_resolution}mm.nii.gz"
-    # *** CORRECTED Path() USAGE HERE ***
-    if not regrid_to_resolution(Path(t1w_native_image_path_str), high_res_template_path, args.voxel_resolution, L, args.verbose):
-        L.error("Failed to create high-resolution template. Aborting."); return False
+    if not regrid_to_resolution(Path(t1w_native_image_path_str), high_res_template_path, args.voxel_resolution, L, args.verbose): # Path() conversion
+        L.error("Failed to create high-resolution template. Aborting.")
+        runlog["warnings"].append("Failed to create high_res_template.")
+        return False
     runlog["steps"].append(f"High-res template created: {high_res_template_path.name}")
     try:
         template_nifti_image_obj = nib.load(str(high_res_template_path)) 
     except Exception as e_load_template:
-        L.error(f"Failed to load created high-res template {high_res_template_path}: {e_load_template}"); return False
+        L.error(f"Failed to load created high-res template {high_res_template_path}: {e_load_template}"); 
+        runlog["warnings"].append(f"Failed to load high_res_template: {high_res_template_path}")
+        return False
 
     for i in range(num_slabs):
         L.info(f"--- >>> Processing Slab {i+1}/{num_slabs} <<< ---")
@@ -279,25 +338,24 @@ def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_out
         L.info(f"--- Slab {i}: Slicing parent surfaces and voxelizing surface slab components ---")
         slab_pv_volume_files_dict: Dict[str, Path] = {} 
 
-        for parent_name, parent_mesh_fpath_val in parent_mesh_files.items(): # iterate over exported files
+        for parent_name, parent_mesh_fpath_val in parent_mesh_files.items(): 
             L.debug(f"Slab {i}: Processing parent surface part: {parent_name} from file {parent_mesh_fpath_val.name}")
             parent_mesh_trimesh_obj = valid_parent_meshes_trimesh.get(parent_name) 
             if not parent_mesh_trimesh_obj: 
-                L.warning(f"Trimesh object for {parent_name} (file: {parent_mesh_fpath_val.name}) not found in valid_parent_meshes_trimesh. Skipping."); 
+                L.warning(f"Trimesh object for {parent_name} (file: {parent_mesh_fpath_val.name}) not found in valid_parent_meshes_trimesh. Skipping.")
                 continue
 
             surface_slab_mesh_obj = None 
             try:
                 engine_choice = None 
                 if shutil.which('blender'): engine_choice = 'blender'
-                # elif shutil.which('openscad'): engine_choice = 'scad' 
                 
                 L.debug(f"Slab {i}: Intersecting {parent_name} with slab box {i} using engine: {engine_choice or 'trimesh_default'}")
-                # Ensure parent_mesh_trimesh_obj is watertight for robust booleans if possible
-                # if not parent_mesh_trimesh_obj.is_watertight:
-                #     L.debug(f"Parent mesh {parent_name} is not watertight. Attempting to fill holes before intersection.")
-                #     parent_mesh_trimesh_obj.fill_holes() # This might be too aggressive or slow
-                
+                # To ensure intersection works, both meshes should be valid.
+                # slab_box_def_current is a trimesh.primitives.Box, which is a Trimesh object.
+                if not parent_mesh_trimesh_obj.is_volume: L.debug(f"Parent mesh {parent_name} is not a volume, intersection might be tricky.")
+                if not slab_box_def_current.is_volume: L.debug(f"Slab definition box {i} is not a volume.")
+
                 intersected_obj = trimesh.boolean.intersection([parent_mesh_trimesh_obj, slab_box_def_current], engine=engine_choice) 
                 if isinstance(intersected_obj, trimesh.Trimesh) and not intersected_obj.is_empty:
                     surface_slab_mesh_obj = intersected_obj
@@ -326,7 +384,6 @@ def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_out
             else:
                 L.warning(f"Slab {i}: Failed to voxelize surface slab for {parent_name} from {temp_surface_slab_fpath.name}")
             
-            # Only clean this specific temp file if no_clean is false for the whole script
             if not args.no_clean: temp_surface_slab_fpath.unlink(missing_ok=True)
         
         if not slab_pv_volume_files_dict: L.warning(f"Slab {i}: No PVs generated. Skipping this slab."); continue
@@ -355,18 +412,19 @@ def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_out
             "BrainMask", slab_pv_volume_files_dict, binarized_slab_key_mask_dir, i, args.subject_id, args.pv_threshold)
         if M_KeyStruct_Slab_i_data_dict["BrainMask"] is None:
             L.error(f"BrainMask volume for slab {i} essential and missing. Skipping slab."); continue
-
-        pial_complex_member_keys = ["pial_L", "pial_R", "corpus_callosum", "cerebellum_cortex", "brainstem"]
+        
+        # Define the actual keys expected from parent_meshes_trimesh based on how they were added
+        pial_complex_actual_keys = ["pial_L", "pial_R", "corpus_callosum", "cerebellum_cortex", "brainstem"]
         pial_arrays_to_union_list = [load_binarize_save_pv_slab(k, slab_pv_volume_files_dict, binarized_slab_key_mask_dir, i, args.subject_id, args.pv_threshold) 
-                                 for k in pial_complex_member_keys if k in slab_pv_volume_files_dict] 
+                                 for k in pial_complex_actual_keys if k in slab_pv_volume_files_dict] 
         M_KeyStruct_Slab_i_data_dict["PialComplex"] = vol_union_numpy(pial_arrays_to_union_list)
         if M_KeyStruct_Slab_i_data_dict["PialComplex"] is not None:
             save_numpy_as_nifti(M_KeyStruct_Slab_i_data_dict["PialComplex"], template_nifti_image_obj, binarized_slab_key_mask_dir / f"{args.subject_id}_slab-{i}_desc-PialComplex_mask.nii.gz", L)
         else: M_KeyStruct_Slab_i_data_dict["PialComplex"] = np.zeros_like(M_KeyStruct_Slab_i_data_dict["BrainMask"]) 
 
-        white_complex_member_keys = ["white_L", "white_R", "corpus_callosum", "cerebellum_wm", "brainstem"]
+        white_complex_actual_keys = ["white_L", "white_R", "corpus_callosum", "cerebellum_wm", "brainstem"] 
         white_arrays_to_union_list = [load_binarize_save_pv_slab(k, slab_pv_volume_files_dict, binarized_slab_key_mask_dir, i, args.subject_id, args.pv_threshold)
-                                 for k in white_complex_member_keys if k in slab_pv_volume_files_dict]
+                                 for k in white_complex_actual_keys if k in slab_pv_volume_files_dict]
         M_KeyStruct_Slab_i_data_dict["WhiteComplex"] = vol_union_numpy(white_arrays_to_union_list)
         if M_KeyStruct_Slab_i_data_dict["WhiteComplex"] is not None:
             save_numpy_as_nifti(M_KeyStruct_Slab_i_data_dict["WhiteComplex"], template_nifti_image_obj, binarized_slab_key_mask_dir / f"{args.subject_id}_slab-{i}_desc-WhiteComplex_mask.nii.gz", L)
@@ -395,8 +453,11 @@ def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_out
         m_vent = M_KeyStruct_Slab_i_data_dict["VentriclesCombined"]
         m_sgm = M_KeyStruct_Slab_i_data_dict["SGMCombined"]
 
+        # Ensure all arrays are valid before proceeding with math
         if any(v is None for v in [m_bm, m_pc, m_wc, m_vent, m_sgm]): 
-            L.error(f"Slab {i}: One or more key masks missing. Skipping material definition."); continue
+            L.error(f"Slab {i}: One or more key masks (BrainMask, PialComplex, WhiteComplex, VentriclesCombined, SGMCombined) is missing or failed to load after binarization. Skipping material definition for this slab.")
+            runlog["warnings"].append(f"Slab {i}: Missing key masks for volumetric math.")
+            continue
 
         final_material_volumes_to_mesh_dict: Dict[str, Path] = {} 
 
@@ -465,8 +526,8 @@ def main():
         L_main.info(f"Using specified work directory: {work_dir_path}")
         runlog["steps"].append(f"Using specified work directory: {work_dir_path}")
         success = main_wf(args, L_main, work_dir_path, final_stl_output_dir, runlog)
-        if args.no_clean:
-            L_main.info(f"Work directory {work_dir_path} retained as per --no_clean or specific --work_dir.")
+        # --no_clean is effectively true if --work_dir is specified, as we don't delete it.
+        if args.no_clean : L_main.debug("--no_clean is active (or implicit due to --work_dir).")
     else:
         with temp_dir(tag=f"{script_name_stem}_work", keep=args.no_clean, base_dir=str(args.output_dir)) as temp_d_str:
             temp_work_dir_path = Path(temp_d_str)

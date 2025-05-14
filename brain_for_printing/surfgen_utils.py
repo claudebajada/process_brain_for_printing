@@ -82,7 +82,7 @@ def generate_single_brain_mask_surface(
             ext=".nii.gz",
             logger=logger
         )
-        logger.info(f"Found T1w brain mask: {mask_file_t1}")
+        logger.info(f"Found T1w brain mask: {mask_file_t1_str}")
 
         final_mask_path = Path(mask_file_t1_str)
 
@@ -254,7 +254,7 @@ def generate_brain_surfaces(
         else:
             L.warning(f"Structure '{s_name}' not directly known by generate_brain_surfaces's ASEG map. Will be skipped if it relies on aseg_utils.extract_structure_surface with this exact name.")
     
-    extract_structures = valid_extract_structures
+    extract_structures = valid_extract_structures_for_aseg
     
     SURF_NAME_MAP = {
         "pial": "pial",
