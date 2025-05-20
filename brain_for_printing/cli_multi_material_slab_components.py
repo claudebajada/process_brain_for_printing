@@ -10,7 +10,7 @@ suitable for 3D printing.Workflow:
 4. Crop these full AC-PC binarized masks.
 5. Extract volumetric slabs from the cropped AC-PC masks.
 6. Perform volumetric math on these AC-PC slabs to define material NIfTIs.
-7. Resample these AC-PC material NIfTIs back to native T1w space (preferably using ANTs).
+7. Resample these AC-PC material NIfTIs back to native T1w space (using ANTs).
 8. Mesh these native T1w material NIfTIs to create initial native T1w space STLs.
 9. Optionally, flatten caps:
     a. Transform native mesh to AC-PC space.
@@ -148,7 +148,7 @@ def flatten_mesh_caps_acpc(
         logger.warning("Input mesh for flattening is empty. Skipping.")
         return mesh
 
-    original_native_vertices = mesh.vertices.copy()
+    original_native_vertices = mesh.vertices.copy() 
 
     try:
         mesh_acpc_transformed = mesh.copy()
@@ -181,11 +181,16 @@ def flatten_mesh_caps_acpc(
             logger.info("No vertices were snapped for either cap.")
             if output_space_is_acpc:
                 logger.info("Returning original mesh transformed to ACPC space (as no snapping occurred).")
-                # Ensure it's processed if it was just transformed
-                return mesh_acpc_transformed.process(validate=True) if not mesh_acpc_transformed.is_empty else mesh_acpc_transformed
+                # Process the already ACPC-transformed mesh before returning
+                mesh_acpc_transformed.process(validate=True) # Basic processing
+                if mesh_acpc_transformed.is_empty: # Check after processing
+                    logger.warning("Original mesh (transformed to ACPC) became empty after processing. Returning None.")
+                    return None
+                return mesh_acpc_transformed
             else:
                 logger.info("Returning original native mesh (as no snapping occurred).")
-                return mesh # Original native mesh, already processed by vol_to_mesh
+                # Original native mesh should already be processed from vol_to_mesh
+                return mesh 
 
         flattened_mesh_acpc = trimesh.Trimesh(vertices=modified_vertices_acpc, faces=mesh.faces, process=False)
 
@@ -232,12 +237,11 @@ def flatten_mesh_caps_acpc(
 def acpc_align_t1w(
     input_t1w_path: Path,
     output_acpc_t1w_path: Path,
-    # output_transform_mat_path: Path, # This will be determined internally now based on actual_flirt_src
     mni_template_path: Path,
-    temp_dir_path: Path, # Used for robustfov output and constructing mat path
+    temp_dir_path: Path, 
     logger: logging.Logger,
     verbose: bool = False
-) -> Tuple[bool, Optional[Path], Optional[Path]]: # Returns success, actual_flirt_src_path, actual_flirt_mat_path
+) -> Tuple[bool, Optional[Path], Optional[Path]]:
     logger.info(f"Starting AC-PC alignment for {input_t1w_path.name} -> {output_acpc_t1w_path.name}")
     require_cmds(["flirt", "robustfov"], logger=logger)
 
@@ -260,7 +264,6 @@ def acpc_align_t1w(
     except Exception as e_fov:
         logger.warning(f"robustfov failed: {e_fov}. Using original T1w '{input_t1w_path.name}' for FLIRT to AC-PC.", exc_info=verbose)
 
-    # Determine the output .mat path based on the actual source image for FLIRT
     flirt_output_mat_path = temp_dir_path / f"{t1w_to_flirt_actual.name.replace('.nii.gz','').replace('.nii','')}_to_acpc.mat"
 
     flirt_cmd = [
@@ -310,53 +313,68 @@ def resample_volume_to_native_space_ants(
     output_native_slab_volume_path: Path,
     native_reference_image_path: Path,
     acpc_to_native_world_affine_matrix: np.ndarray,
-    work_dir_for_temp_xfm: Path, # For storing temp ANTs transform file
+    work_dir_for_temp_xfm: Path, 
     logger: logging.Logger,
-    interpolation_method: str = "Linear", # Default for continuous data
+    interpolation_method: str = "Linear", 
     verbose: bool = False
 ) -> bool:
     logger.info(f"Resampling (ANTs) '{input_acpc_slab_volume_path.name}' to native space -> '{output_native_slab_volume_path.name}'")
-    require_cmds(["antsApplyTransforms"], logger=logger)
+    # require_cmds is called once in main_wf
 
-    # Create a unique name for the temporary transform file to avoid clashes if run in parallel for slabs
-    temp_ants_transform_filename = f"temp_acpc_to_native_world_ants_{uuid.uuid4().hex[:8]}.txt"
+    # Use .tfm extension for ITK text transforms, or .txt if preferred by local ANTs.
+    # ANTs is generally flexible with .txt for these if formatted correctly.
+    temp_ants_transform_filename = f"temp_acpc_to_native_itk_affine_{uuid.uuid4().hex[:8]}.txt"
     temp_ants_transform_path = work_dir_for_temp_xfm / temp_ants_transform_filename
 
     try:
-        # Save the world affine matrix to a temporary ITK-compatible .txt file for ANTs
-        # ANTs convention is space-separated.
-        # The transform should map points from the space of input_acpc_slab_volume_path
-        # to the space of native_reference_image_path.
-        # The acpc_to_native_world_affine_matrix is exactly this.
+        matrix_3x3_elements = acpc_to_native_world_affine_matrix[0:3, 0:3].flatten() # Should be row-major
+        translation_3_elements = acpc_to_native_world_affine_matrix[0:3, 3]
+        
+        # Format numbers explicitly to avoid locale issues or unexpected string conversions
+        parameters_values_str = " ".join([f"{p:.10f}" for p in matrix_3x3_elements]) + \
+                                " " + \
+                                " ".join([f"{p:.10f}" for p in translation_3_elements])
+        
+        # Standard ITK fixed parameters (center of rotation for a global affine)
+        fixed_parameters_values_str = "0.0000000000 0.0000000000 0.0000000000"
+
         with open(temp_ants_transform_path, 'w') as f:
             f.write("#Insight Transform File V1.0\n")
             f.write("#Transform 0\n")
             f.write("Transform: AffineTransform_double_3_3\n")
-            # ANTs affine parameters: 3x3 matrix (row-major) followed by 3 translation components
-            # Our 4x4 matrix: R R R T
-            #                  R R R T
-            #                  R R R T
-            #                  0 0 0 1
-            matrix_3x3 = acpc_to_native_world_affine_matrix[0:3, 0:3].flatten()
-            translation_3 = acpc_to_native_world_affine_matrix[0:3, 3]
-            parameters_line = "Parameters: " + " ".join(map(str, matrix_3x3)) + " " + " ".join(map(str, translation_3))
-            f.write(parameters_line + "\n")
-            f.write("FixedParameters: 0 0 0\n") # Center of rotation, usually 0 0 0 for this type of global affine
+            f.write(f"Parameters: {parameters_values_str}\n")
+            f.write(f"FixedParameters: {fixed_parameters_values_str}\n")
 
-        logger.debug(f"Saved temporary ANTs affine transform to: {temp_ants_transform_path}")
+        logger.debug(f"Saved temporary ITK-style ANTs affine transform to: {temp_ants_transform_path}")
+
+        ants_interp = interpolation_method
+        if interpolation_method.lower() == "trilinear":
+            ants_interp = "Linear"
+        elif interpolation_method.lower() == "nearestneighbor" or interpolation_method.lower() == "nearest":
+            ants_interp = "NearestNeighbor"
+        elif interpolation_method.lower() == "multilabel" or interpolation_method.lower() == "genericlabel":
+             ants_interp = "GenericLabel"
 
         cmd = [
             "antsApplyTransforms", "-d", "3",
             "-i", str(input_acpc_slab_volume_path),
             "-r", str(native_reference_image_path),
             "-o", str(output_native_slab_volume_path),
-            "-t", str(temp_ants_transform_path),
-            "-n", interpolation_method # e.g., "Linear", "NearestNeighbor", "Gaussian", "BSpline"
+            "-t", str(temp_ants_transform_path), 
+            "-n", ants_interp,
+            "--default-value", "0"
         ]
+        
         logger.debug(f"Running antsApplyTransforms for resampling to native: {' '.join(cmd)}")
         run_cmd(cmd, verbose=verbose)
 
         if output_native_slab_volume_path.exists() and output_native_slab_volume_path.stat().st_size > 0:
+            out_img = nib.load(str(output_native_slab_volume_path))
+            ref_img_loaded = nib.load(str(native_reference_image_path))
+            if not np.allclose(out_img.affine, ref_img_loaded.affine):
+                logger.warning(f"Output affine for {output_native_slab_volume_path.name} does not precisely match reference {native_reference_image_path.name} affine!")
+                logger.debug(f"Output affine:\n{out_img.affine}")
+                logger.debug(f"Reference affine:\n{ref_img_loaded.affine}")
             logger.info(f"Successfully resampled to native space using ANTs: {output_native_slab_volume_path.name}")
             return True
         else:
@@ -366,10 +384,10 @@ def resample_volume_to_native_space_ants(
         logger.error(f"Resampling to native space with ANTs failed for {input_acpc_slab_volume_path.name}: {e}", exc_info=verbose)
         return False
     finally:
-        temp_ants_transform_path.unlink(missing_ok=True)
-        logger.debug(f"Cleaned up temporary ANTs transform: {temp_ants_transform_path}")
+        if temp_ants_transform_path.exists():
+            temp_ants_transform_path.unlink(missing_ok=True)
+            logger.debug(f"Cleaned up temporary ANTs transform: {temp_ants_transform_path}")
 
-# ... (get_volume_bounding_box_voxel_coords, crop_nifti_volume_fslroi, extract_volumetric_slab_fslroi, vol_to_mesh remain unchanged) ...
 def get_volume_bounding_box_voxel_coords(volume_path: Path, logger: logging.Logger) -> Optional[Tuple[np.ndarray, np.ndarray]]:
     try:
         img = nib.load(str(volume_path))
@@ -595,7 +613,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip_outer_csf", action="store_true", help="Skip generation of the outer CSF component.")
     parser.add_argument("--no_clean", action="store_true", help="Keep work directory if it was temporary.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable detailed logging.")
-    parser.add_argument("--flatten_caps_tolerance_mm", type=float, default=0.8,
+    parser.add_argument("--flatten_caps_tolerance_mm", type=float, default=0.5,
                         help="EXPERIMENTAL: If set (e.g. 0.5), attempts to flatten mesh caps by snapping vertices. "
                              "Value is the tolerance in mm for selecting cap vertices in AC-PC space. "
                              "Requires fslpy for accurate transformations.")
@@ -603,6 +621,7 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="If set, the final output slab meshes will be in ACPC space after cap flattening. "
                              "Otherwise, they are in native T1w space (default). Meshing always occurs from native T1w volumes.")
     return parser
+
 
 def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_output_base_dir: Path, runlog: Dict[str, Any]):
     runlog["steps"].append("Starting multi-material slab component generation.")
@@ -615,11 +634,9 @@ def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_out
         L.info("Final slab meshes will be output in Native T1w space (after cap flattening if enabled).")
 
     mrtrix_cmds = ["mrgrid", "mesh2voxel"]
-    # Add antsApplyTransforms to required commands if we are using it
     fsl_cmds = ["flirt", "fslroi", "robustfov", "convert_xfm"]
-    ants_cmds = ["antsApplyTransforms"] # For the new resampling step
+    ants_cmds = ["antsApplyTransforms"] 
     require_cmds(mrtrix_cmds + fsl_cmds + ants_cmds, logger=L)
-
 
     # Define directories
     acpc_align_dir = work_dir / "00_acpc_alignment"
@@ -630,10 +647,11 @@ def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_out
     volumetric_slabs_acpc_dir = work_dir / "05_volumetric_slabs_acpc_nifti"
     material_slabs_acpc_vol_dir = work_dir / "06_material_slabs_acpc_volumes_nifti"
     material_slabs_native_vol_dir = work_dir / "07_material_slabs_native_volumes_nifti"
+    temp_ants_xfm_dir = work_dir / "08_temp_ants_transforms" # For temporary transform files for ANTs
     
     dirs_to_create = [acpc_align_dir, parent_surf_gen_dir, full_vol_voxelized_dir,
                    full_vol_binarized_dir, cropped_full_vol_dir, volumetric_slabs_acpc_dir,
-                   material_slabs_acpc_vol_dir, material_slabs_native_vol_dir] # Native dir always created now
+                   material_slabs_acpc_vol_dir, material_slabs_native_vol_dir, temp_ants_xfm_dir]
         
     for d_path in dirs_to_create:
         d_path.mkdir(parents=True, exist_ok=True)
@@ -692,7 +710,7 @@ def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_out
                 L.info("Successfully calculated ACPC-to-native world affine (inverse).")
             except np.linalg.LinAlgError as e_inv:
                 L.error(f"Failed to invert native-to-ACPC world affine: {e_inv}. "
-                        "This will affect cap flattening if native output is chosen and ANTs resampling.", exc_info=True)
+                        "This will affect cap flattening and ANTs resampling.", exc_info=True) # Updated message
                 acpc_to_native_world_affine = None 
         else:
             L.error("Failed to derive native-to-ACPC world affine using fslpy. Cap flattening and ANTs resampling will be impacted.")
@@ -710,13 +728,12 @@ def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_out
             L.warning("Disabling cap flattening for native output as acpc_to_native_world_affine could not be computed.")
             args.flatten_caps_tolerance_mm = None
     
-    if acpc_to_native_world_affine is None:
+    if acpc_to_native_world_affine is None: # This is needed for ANTs resampling
         L.warning("ACPC-to-Native world affine is not available. ANTs-based resampling (Step 8) will be skipped, "
-                  "which may lead to misaligned native slabs if FLIRT was also problematic.")
+                  "which may lead to misaligned native slabs.")
 
 
     # --- Step 2: Creating High-Resolution Master AC-PC Template ---
-    # ... (This section remains unchanged) ...
     L.info("--- Step 2: Creating High-Resolution Master AC-PC Template ---")
     master_hires_acpc_template_path = acpc_align_dir / f"{args.subject_id}_master_hires_acpc_template_{args.voxel_resolution}mm.nii.gz"
     if not regrid_to_resolution(t1w_acpc_aligned_path, master_hires_acpc_template_path, args.voxel_resolution, L, args.verbose):
@@ -729,7 +746,6 @@ def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_out
         L.error(f"Failed to load master AC-PC template {master_hires_acpc_template_path}: {e_load_master_template}", exc_info=True); return False
 
     # --- Step 3: Generating full parent T1-space surfaces ---
-    # ... (This section remains unchanged) ...
     L.info("--- Step 3: Generating full parent T1-space surfaces (Trimesh objects) ---")
     parent_meshes_trimesh: Dict[str, Optional[trimesh.Trimesh]] = {}
     L.info(f"Generating BrainMask surface with {args.brain_mask_inflate_mm}mm inflation...")
@@ -786,7 +802,6 @@ def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_out
     L.info(f"Generated {len(valid_parent_meshes_trimesh)} initial parent Trimesh surfaces: {list(valid_parent_meshes_trimesh.keys())}")
 
     # --- Step 4: Voxelizing full parent surfaces onto Master AC-PC Template ---
-    # ... (This section remains unchanged) ...
     L.info(f"--- Step 4: Voxelizing full parent surfaces onto Master AC-PC Template ({master_hires_acpc_template_path.name}) ---")
     full_acpc_binarized_masks: Dict[str, Path] = {}
     temp_obj_export_dir_for_acpc_voxelization = full_vol_voxelized_dir / "temp_acpc_aligned_objs"
@@ -835,7 +850,6 @@ def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_out
     L.info(f"Voxelized and binarized {len(full_acpc_binarized_masks)} full parent surfaces onto AC-PC grid.")
 
     # --- Step 5: Determining global bounding box for cropping ---
-    # ... (This section remains unchanged) ...
     L.info("--- Step 5: Determining global bounding box for cropping full AC-PC volumes ---")
     overall_min_coords_vox: Optional[np.ndarray] = None
     overall_max_coords_vox: Optional[np.ndarray] = None
@@ -877,11 +891,9 @@ def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_out
     if args.flatten_caps_tolerance_mm is not None and cropped_acpc_grid_affine_for_caps is None:
         L.error("Cap flattening enabled, but could not determine affine of the cropped AC-PC grid. Disabling feature.")
         runlog["warnings"].append("Failed to get AC-PC cropped grid affine; cap flattening disabled.")
-        args.flatten_caps_tolerance_mm = None # Disable if this crucial affine is missing
-
+        args.flatten_caps_tolerance_mm = None 
 
     # --- Step 6: Performing volumetric slicing (in AC-PC space) ---
-    # ... (This section remains unchanged) ...
     L.info("--- Step 6: Performing volumetric slicing (in AC-PC space) ---")
     orientation_map = {"axial": 2, "coronal": 1, "sagittal": 0}
     slice_axis_idx = orientation_map[args.slab_orientation]
@@ -942,7 +954,6 @@ def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_out
     L.info(f"Processed {num_slabs_generated} volumetric AC-PC slabs definitions.")
     runlog["num_slabs_defined"] = num_slabs_generated
 
-
     # --- Loop through each defined slab index for material processing ---
     for slab_idx in range(num_slabs_generated):
         L.info(f"--- >>> Processing Materials for Slab {slab_idx + 1}/{num_slabs_generated} <<< ---")
@@ -951,7 +962,6 @@ def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_out
             L.warning(f"Slab {slab_idx}: No AC-PC component NIfTI files found for material definition. Skipping slab."); continue
 
         # --- Step 7: Volumetric Math for Materials (in AC-PC space for this slab) ---
-        # ... (This section remains largely unchanged, populates material_acpc_slab_volumes_to_process) ...
         M_KeyStruct_Slab_i_data_dict: Dict[str, Optional[np.ndarray]] = {}
         example_acpc_slab_nifti_path_for_saving_template: Optional[Path] = None
 
@@ -1040,29 +1050,26 @@ def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_out
         native_space_reference_for_final_resampling = actual_flirt_src_path 
         L.info(f"Using '{native_space_reference_for_final_resampling.name}' as the reference grid for native space resampling (Step 8).")
 
-        temp_ants_xfm_for_step8_dir = work_dir / "temp_ants_transforms_step8" # Specific subdir for these temp files
-        temp_ants_xfm_for_step8_dir.mkdir(parents=True, exist_ok=True)
-
-
         for mat_name, acpc_vol_path in material_acpc_slab_volumes_to_process.items():
             native_vol_path = material_slabs_native_vol_dir / f"{args.subject_id}_slab-{slab_idx}_desc-{mat_name}_native_resampled.nii.gz"
             
             if acpc_to_native_world_affine is not None: 
+                # Prefer ANTs if the world affine is available
                 if resample_volume_to_native_space_ants( 
                     acpc_vol_path, native_vol_path,
                     native_space_reference_for_final_resampling,
                     acpc_to_native_world_affine, 
-                    temp_ants_xfm_for_step8_dir, # Pass work_dir for temp xfm file
-                    L, interpolation_method="Linear", verbose=args.verbose 
+                    temp_ants_xfm_dir, # Pass the dedicated temp dir for ANTs xfms
+                    L, interpolation_method="MultiLabel", verbose=args.verbose # Use MultiLabel for masks
                 ):
                     final_material_volumes_to_mesh[mat_name] = native_vol_path
                 else:
                     L.warning(f"Failed to resample {mat_name} for slab {slab_idx} to native space using ANTs. Skipping meshing.")
             else:
+                # Fallback or error if acpc_to_native_world_affine is None
                 L.error(f"Skipping native resampling of {mat_name} for slab {slab_idx} as world affine for ANTs is missing. "
                         "This will likely result in misaligned or missing final STLs for this material.")
                 runlog["warnings"].append(f"Slab {slab_idx}, Mat {mat_name}: Skipped native resampling (ANTs), world affine missing.")
-
 
         runlog["steps"].append(f"Slab {slab_idx}: Resampling of materials to native space (attempted with ANTs) completed.")
 
@@ -1107,7 +1114,7 @@ def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_out
 
 
         for mat_name in material_vol_names_for_mesh:
-            native_vol_path_for_mesh = final_material_volumes_to_mesh.get(mat_name) # Meshing is always from native volumes
+            native_vol_path_for_mesh = final_material_volumes_to_mesh.get(mat_name) 
             if native_vol_path_for_mesh and native_vol_path_for_mesh.exists():
                 stl_path = stl_output_base_dir / f"{args.subject_id}_slab-{slab_idx}_desc-{mat_name}_material_space-{final_output_space_str.lower()}.stl"
                 
@@ -1121,8 +1128,6 @@ def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_out
                         if not native_mesh_for_flattening.is_empty:
                             ideal_coord_min, ideal_coord_max = ideal_cap_coords_world_for_slab
                             
-                            # flatten_mesh_caps_acpc ALWAYS expects a native mesh as input.
-                            # Its output space is controlled by output_space_is_acpc.
                             flattened_mesh_final_space = flatten_mesh_caps_acpc(
                                 mesh=native_mesh_for_flattening, 
                                 native_to_acpc_world_affine=native_to_acpc_world_affine, 
@@ -1135,9 +1140,8 @@ def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_out
                                 output_space_is_acpc=args.output_final_slabs_in_acpc_space
                             )
                             if flattened_mesh_final_space and not flattened_mesh_final_space.is_empty:
-                                # Check if vertices changed OR if the space itself implies a change from native STL
                                 if not np.array_equal(flattened_mesh_final_space.vertices, native_mesh_for_flattening.vertices) or \
-                                   (args.output_final_slabs_in_acpc_space and native_to_acpc_world_affine is not None): # If output is ACPC, it's different from native
+                                   (args.output_final_slabs_in_acpc_space and native_to_acpc_world_affine is not None): 
                                     L.info(f"Caps/Space potentially modified for {stl_path.name}. Exporting updated version to {final_output_space_str} space.")
                                     flattened_mesh_final_space.export(str(stl_path)) 
                                     runlog["steps"].append(f"Caps flattened and mesh saved in {final_output_space_str} for {mat_name} slab {slab_idx}")
@@ -1162,9 +1166,9 @@ def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_out
                 L.warning(f"Native space volume for {mat_name} slab {slab_idx} not found or not saved. Skipping mesh generation.")
         runlog["steps"].append(f"Slab {slab_idx}: Meshing of final materials from native space completed. Output STLs in {final_output_space_str} space.")
     
-    if not args.no_clean and (work_dir / "temp_ants_transforms_step8").exists():
+    if not args.no_clean and temp_ants_xfm_dir.exists(): # Clean up ANTs temp dir
         try:
-            shutil.rmtree(work_dir / "temp_ants_transforms_step8")
+            shutil.rmtree(temp_ants_xfm_dir)
             L.debug("Cleaned up temporary ANTs transform directory for Step 8.")
         except OSError as e_clean_ants:
             L.warning(f"Could not remove temporary ANTs transform directory: {e_clean_ants}")
