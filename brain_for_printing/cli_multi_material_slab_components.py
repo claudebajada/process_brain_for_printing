@@ -3,19 +3,17 @@
 
 """
 Generates distinct, non-overlapping multi-material brain slab components
-suitable for 3D printing.Workflow:
-1. AC-PC align T1w.
-2. Generate parent surfaces (BrainMask, Pial complex, White complex, SGM/Ventricles) in T1w space.
-3. Voxelize parent T1w surfaces onto a high-resolution AC-PC grid (transforming them to AC-PC space first).
-4. Crop these full AC-PC binarized masks.
-5. Extract volumetric slabs from the cropped AC-PC masks.
-6. Perform volumetric math on these AC-PC slabs to define material NIfTIs.
-7. Resample these AC-PC material NIfTIs back to native T1w space (using ANTs).
-8. Mesh these native T1w material NIfTIs to create initial native T1w space STLs.
-9. Optionally, flatten caps:
-    a. Transform native mesh to AC-PC space.
-    b. Snap vertices to ideal AC-PC planes.
-    c. Output either in AC-PC space (if requested) or transform back to native T1w space.
+suitable for 3D printing. Workflow:
+1. Initial AC-PC Alignment of Input T1w Image.
+2. Create High-Resolution AC-PC Master Template.
+3. Generate Parent Surfaces in Native T1w Space.
+4. Voxelize Parent Surfaces onto AC-PC Master Template (transforming them to AC-PC space).
+5. Determine Global Bounding Box & Crop AC-PC Volumes.
+6. Volumetric Slicing in AC-PC Space.
+7. Define Material Volumes per Slab (AC-PC Space).
+8. Mesh AC-PC Material Slabs using voxel2mesh (MRtrix3) to create STL files.
+
+The final STLs are saved in AC-PC space in a specified output directory.
 """
 
 import argparse
@@ -26,7 +24,6 @@ import os
 import shutil
 import uuid
 
-import trimesh
 import nibabel as nib
 import numpy as np
 from typing import Dict, Optional, List, Any, Tuple
@@ -36,7 +33,7 @@ from .io_utils import temp_dir, require_cmds, flexible_match, run_cmd
 from .log_utils import get_logger, write_log
 from .surfgen_utils import generate_single_brain_mask_surface, generate_brain_surfaces
 from .five_tt_utils import run_5ttgen_hsvs_save_temp_bids, load_subcortical_and_ventricle_meshes, is_vtk_available
-from .mesh_utils import volume_to_gifti, gifti_to_trimesh
+# mesh_utils.volume_to_gifti and gifti_to_trimesh might not be needed if vol_to_mesh is fully replaced
 from .config_utils import parse_preset
 from .volumetric_utils import (
     regrid_to_resolution,
@@ -63,7 +60,7 @@ try:
     _L_HELPERS.info("fslpy library found and will be used for FLIRT matrix conversions.")
 except ImportError:
     _L_HELPERS.warning("fslpy library not found. FLIRT matrix to world-world affine conversion will be limited. "
-                     "Cap flattening and ANTs-based resampling rely on these for accurate transformations.")
+                     "Accurate transformations (e.g. for Step 4 voxelization) might be impacted if only FSL .mat files are used without fslpy interpretation.")
     pass
 
 def get_flirt_world_to_world_affine(
@@ -106,133 +103,6 @@ def get_flirt_world_to_world_affine(
     except Exception as e:
         local_logger.error(f"Error converting FLIRT matrix {fsl_flirt_mat_path.name} using fslpy: {e}", exc_info=True)
         return None
-
-def get_ideal_cap_coords_world_acpc(
-    slab_def_vox_start: int,
-    slab_def_vox_thickness: int,
-    slice_axis_idx_acpc: int,
-    cropped_acpc_grid_affine: np.ndarray,
-    logger: logging.Logger
-) -> Optional[Tuple[float, float]]:
-    try:
-        min_plane_vox_coord = np.zeros(4)
-        min_plane_vox_coord[slice_axis_idx_acpc] = slab_def_vox_start
-        min_plane_vox_coord[3] = 1
-        max_plane_vox_coord = np.zeros(4)
-        max_plane_vox_coord[slice_axis_idx_acpc] = slab_def_vox_start + slab_def_vox_thickness
-        max_plane_vox_coord[3] = 1
-        min_plane_world_hom = cropped_acpc_grid_affine @ min_plane_vox_coord
-        max_plane_world_hom = cropped_acpc_grid_affine @ max_plane_vox_coord
-        ideal_coord_min_world = min_plane_world_hom[slice_axis_idx_acpc]
-        ideal_coord_max_world = max_plane_world_hom[slice_axis_idx_acpc]
-        if ideal_coord_min_world > ideal_coord_max_world: 
-            ideal_coord_min_world, ideal_coord_max_world = ideal_coord_max_world, ideal_coord_min_world
-        return float(ideal_coord_min_world), float(ideal_coord_max_world)
-    except Exception as e:
-        logger.error(f"Failed to calculate ideal cap coordinates: {e}", exc_info=True)
-        return None
-
-def flatten_mesh_caps_acpc(
-    mesh: trimesh.Trimesh, # Expected to be in Native T1w space
-    native_to_acpc_world_affine: np.ndarray,
-    acpc_to_native_world_affine: np.ndarray, # Only used if output_space_is_acpc is False
-    ideal_coord_min_acpc: float,
-    ideal_coord_max_acpc: float,
-    slice_axis_idx_acpc: int,
-    tolerance_mm: float,
-    logger: logging.Logger,
-    output_space_is_acpc: bool = False
-) -> Optional[trimesh.Trimesh]:
-
-    if mesh.is_empty:
-        logger.warning("Input mesh for flattening is empty. Skipping.")
-        return mesh
-
-    original_native_vertices = mesh.vertices.copy() 
-
-    try:
-        mesh_acpc_transformed = mesh.copy()
-        logger.debug("Transforming input (native) mesh to AC-PC space for cap flattening.")
-        mesh_acpc_transformed.apply_transform(native_to_acpc_world_affine)
-        
-        logger.debug(f"Mesh for snapping (in AC-PC space). Bounds: {mesh_acpc_transformed.bounds}")
-
-        acpc_vertices_for_snapping = mesh_acpc_transformed.vertices.copy()
-        modified_vertices_acpc = acpc_vertices_for_snapping.copy()
-        target_coord_idx = slice_axis_idx_acpc
-
-        min_cap_mask = np.abs(acpc_vertices_for_snapping[:, target_coord_idx] - ideal_coord_min_acpc) < tolerance_mm
-        num_min_verts = np.sum(min_cap_mask)
-        if num_min_verts > 0:
-            modified_vertices_acpc[min_cap_mask, target_coord_idx] = ideal_coord_min_acpc
-            logger.info(f"Snapped {num_min_verts} vertices to min AC-PC cap (IdealCoord={ideal_coord_min_acpc:.3f} on axis {target_coord_idx})")
-        else:
-            logger.warning(f"No vertices found within tolerance for min AC-PC cap (IdealCoord={ideal_coord_min_acpc:.3f} on axis {target_coord_idx})")
-
-        max_cap_mask = np.abs(acpc_vertices_for_snapping[:, target_coord_idx] - ideal_coord_max_acpc) < tolerance_mm
-        num_max_verts = np.sum(max_cap_mask)
-        if num_max_verts > 0:
-            modified_vertices_acpc[max_cap_mask, target_coord_idx] = ideal_coord_max_acpc
-            logger.info(f"Snapped {num_max_verts} vertices to max AC-PC cap (IdealCoord={ideal_coord_max_acpc:.3f} on axis {target_coord_idx})")
-        else:
-            logger.warning(f"No vertices found within tolerance for max AC-PC cap (IdealCoord={ideal_coord_max_acpc:.3f} on axis {target_coord_idx})")
-
-        if num_min_verts == 0 and num_max_verts == 0:
-            logger.info("No vertices were snapped for either cap.")
-            if output_space_is_acpc:
-                logger.info("Returning original mesh transformed to ACPC space (as no snapping occurred).")
-                # Process the already ACPC-transformed mesh before returning
-                mesh_acpc_transformed.process(validate=True) # Basic processing
-                if mesh_acpc_transformed.is_empty: # Check after processing
-                    logger.warning("Original mesh (transformed to ACPC) became empty after processing. Returning None.")
-                    return None
-                return mesh_acpc_transformed
-            else:
-                logger.info("Returning original native mesh (as no snapping occurred).")
-                # Original native mesh should already be processed from vol_to_mesh
-                return mesh 
-
-        flattened_mesh_acpc = trimesh.Trimesh(vertices=modified_vertices_acpc, faces=mesh.faces, process=False)
-
-        if output_space_is_acpc:
-            logger.info("Processing and outputting flattened mesh in ACPC space.")
-            final_processed_mesh = flattened_mesh_acpc
-            final_processed_mesh.remove_degenerate_faces()
-            if final_processed_mesh.is_empty:
-                logger.error("Mesh (ACPC) became empty after removing degenerate faces post-flattening. Reverting to pre-snapping ACPC state.")
-                return mesh_acpc_transformed.process(validate=True) if not mesh_acpc_transformed.is_empty else None
-
-            final_processed_mesh.fix_normals(multibody=True)
-            final_processed_mesh.process(validate=True)
-            if final_processed_mesh.is_empty:
-                logger.error("Mesh (ACPC) became empty after final processing post-flattening. Reverting to pre-snapping ACPC state.")
-                return mesh_acpc_transformed.process(validate=True) if not mesh_acpc_transformed.is_empty else None
-            logger.info("Successfully flattened mesh caps and processed (ACPC output).")
-            return final_processed_mesh
-        else: 
-            logger.info("Transforming flattened mesh back to native space and processing.")
-            flattened_mesh_native = flattened_mesh_acpc.copy()
-            flattened_mesh_native.apply_transform(acpc_to_native_world_affine)
-            logger.debug(f"Flattened mesh transformed back to native space. Bounds: {flattened_mesh_native.bounds}")
-            
-            final_processed_mesh = flattened_mesh_native
-            final_processed_mesh.remove_degenerate_faces()
-            if final_processed_mesh.is_empty:
-                 logger.error("Mesh (Native) became empty after removing degenerate faces post-flattening. Reverting to original (native).")
-                 return trimesh.Trimesh(vertices=original_native_vertices, faces=mesh.faces, process=True)
-
-            final_processed_mesh.fix_normals(multibody=True)
-            final_processed_mesh.process(validate=True)
-            if final_processed_mesh.is_empty:
-                logger.error("Mesh (Native) became empty after final processing post-flattening. Reverting to original (native).")
-                return trimesh.Trimesh(vertices=original_native_vertices, faces=mesh.faces, process=True)
-            
-            logger.info("Successfully flattened mesh caps and processed (Native output).")
-            return final_processed_mesh
-
-    except Exception as e:
-        logger.error(f"Error during mesh cap flattening: {e}", exc_info=True)
-        return trimesh.Trimesh(vertices=original_native_vertices, faces=mesh.faces, process=True)
 
 def acpc_align_t1w(
     input_t1w_path: Path,
@@ -286,107 +156,6 @@ def acpc_align_t1w(
     except Exception as e:
         logger.error(f"AC-PC alignment using FLIRT failed: {e}", exc_info=verbose)
         return False, t1w_to_flirt_actual, None
-
-def invert_fsl_transform(
-    input_mat_path: Path,
-    output_inverse_mat_path: Path,
-    logger: logging.Logger,
-    verbose: bool = False
-) -> bool:
-    logger.info(f"Inverting transform {input_mat_path.name} -> {output_inverse_mat_path.name}")
-    require_cmds(["convert_xfm"], logger=logger)
-    cmd = ["convert_xfm", "-inverse", str(input_mat_path), "-omat", str(output_inverse_mat_path)]
-    try:
-        run_cmd(cmd, verbose=verbose)
-        if output_inverse_mat_path.exists() and output_inverse_mat_path.stat().st_size > 0:
-            logger.info(f"Successfully inverted transform: {output_inverse_mat_path.name}")
-            return True
-        else:
-            logger.error(f"convert_xfm ran but output inverse transform not created or empty.")
-            return False
-    except Exception as e:
-        logger.error(f"Transform inversion failed: {e}", exc_info=verbose)
-        return False
-
-def resample_volume_to_native_space_ants(
-    input_acpc_slab_volume_path: Path,
-    output_native_slab_volume_path: Path,
-    native_reference_image_path: Path,
-    acpc_to_native_world_affine_matrix: np.ndarray,
-    work_dir_for_temp_xfm: Path, 
-    logger: logging.Logger,
-    interpolation_method: str = "Linear", 
-    verbose: bool = False
-) -> bool:
-    logger.info(f"Resampling (ANTs) '{input_acpc_slab_volume_path.name}' to native space -> '{output_native_slab_volume_path.name}'")
-    # require_cmds is called once in main_wf
-
-    # Use .tfm extension for ITK text transforms, or .txt if preferred by local ANTs.
-    # ANTs is generally flexible with .txt for these if formatted correctly.
-    temp_ants_transform_filename = f"temp_acpc_to_native_itk_affine_{uuid.uuid4().hex[:8]}.txt"
-    temp_ants_transform_path = work_dir_for_temp_xfm / temp_ants_transform_filename
-
-    try:
-        matrix_3x3_elements = acpc_to_native_world_affine_matrix[0:3, 0:3].flatten() # Should be row-major
-        translation_3_elements = acpc_to_native_world_affine_matrix[0:3, 3]
-        
-        # Format numbers explicitly to avoid locale issues or unexpected string conversions
-        parameters_values_str = " ".join([f"{p:.10f}" for p in matrix_3x3_elements]) + \
-                                " " + \
-                                " ".join([f"{p:.10f}" for p in translation_3_elements])
-        
-        # Standard ITK fixed parameters (center of rotation for a global affine)
-        fixed_parameters_values_str = "0.0000000000 0.0000000000 0.0000000000"
-
-        with open(temp_ants_transform_path, 'w') as f:
-            f.write("#Insight Transform File V1.0\n")
-            f.write("#Transform 0\n")
-            f.write("Transform: AffineTransform_double_3_3\n")
-            f.write(f"Parameters: {parameters_values_str}\n")
-            f.write(f"FixedParameters: {fixed_parameters_values_str}\n")
-
-        logger.debug(f"Saved temporary ITK-style ANTs affine transform to: {temp_ants_transform_path}")
-
-        ants_interp = interpolation_method
-        if interpolation_method.lower() == "trilinear":
-            ants_interp = "Linear"
-        elif interpolation_method.lower() == "nearestneighbor" or interpolation_method.lower() == "nearest":
-            ants_interp = "NearestNeighbor"
-        elif interpolation_method.lower() == "multilabel" or interpolation_method.lower() == "genericlabel":
-             ants_interp = "GenericLabel"
-
-        cmd = [
-            "antsApplyTransforms", "-d", "3",
-            "-i", str(input_acpc_slab_volume_path),
-            "-r", str(native_reference_image_path),
-            "-o", str(output_native_slab_volume_path),
-            "-t", str(temp_ants_transform_path), 
-            "-n", ants_interp,
-            "--default-value", "0"
-        ]
-        
-        logger.debug(f"Running antsApplyTransforms for resampling to native: {' '.join(cmd)}")
-        run_cmd(cmd, verbose=verbose)
-
-        if output_native_slab_volume_path.exists() and output_native_slab_volume_path.stat().st_size > 0:
-            out_img = nib.load(str(output_native_slab_volume_path))
-            ref_img_loaded = nib.load(str(native_reference_image_path))
-            if not np.allclose(out_img.affine, ref_img_loaded.affine):
-                logger.warning(f"Output affine for {output_native_slab_volume_path.name} does not precisely match reference {native_reference_image_path.name} affine!")
-                logger.debug(f"Output affine:\n{out_img.affine}")
-                logger.debug(f"Reference affine:\n{ref_img_loaded.affine}")
-            logger.info(f"Successfully resampled to native space using ANTs: {output_native_slab_volume_path.name}")
-            return True
-        else:
-            logger.error(f"ANTs resampling ran but output native volume not created or empty for {output_native_slab_volume_path.name}.")
-            return False
-    except Exception as e:
-        logger.error(f"Resampling to native space with ANTs failed for {input_acpc_slab_volume_path.name}: {e}", exc_info=verbose)
-        return False
-    finally:
-        if temp_ants_transform_path.exists():
-            temp_ants_transform_path.unlink(missing_ok=True)
-            logger.debug(f"Cleaned up temporary ANTs transform: {temp_ants_transform_path}")
 
 def get_volume_bounding_box_voxel_coords(volume_path: Path, logger: logging.Logger) -> Optional[Tuple[np.ndarray, np.ndarray]]:
     try:
@@ -482,104 +251,40 @@ def extract_volumetric_slab_fslroi(
     except Exception as e:
         logger.error(f"Slab extraction with fslroi failed for {slab_label} of {input_cropped_volume_path.name}: {e}", exc_info=verbose); return False
 
-def vol_to_mesh(volume_path: Path, output_mesh_path: Path, no_smooth: bool, logger: logging.Logger) -> bool:
-    logger.info(f"Attempting to convert volume {volume_path.name} to mesh {output_mesh_path.name}")
-    try:
-        img_check = nib.load(str(volume_path))
-        data_check = img_check.get_fdata()
-        is_effectively_empty = False
-        if data_check.dtype == np.uint8 or data_check.dtype == bool: 
-            if data_check.size > 0 and np.sum(data_check) < 10: 
-                is_effectively_empty = True
-        elif data_check.size > 0 and np.max(np.abs(data_check)) < 0.01: 
-             is_effectively_empty = True
-        
-        if is_effectively_empty:
-            logger.info(f"Volume {volume_path.name} appears effectively empty (sum/max criteria). Skipping mesh generation.")
-            return False 
-    except Exception as e:
-        logger.error(f"Could not load volume {volume_path.name} to check if empty: {e}", exc_info=True)
-        return False 
-
-    temp_gii_path = output_mesh_path.with_name(f"{output_mesh_path.stem}_{uuid.uuid4().hex[:6]}.surf.gii")
-    mesh: Optional[trimesh.Trimesh] = None
-
-    try:
-        volume_to_gifti(str(volume_path), str(temp_gii_path), level=0.5) 
-        if temp_gii_path.exists() and temp_gii_path.stat().st_size > 0:
-            mesh = gifti_to_trimesh(str(temp_gii_path)) 
-        else:
-            logger.warning(f"GIFTI file {temp_gii_path.name} was not created or is empty from {volume_path.name}.")
-    except Exception as e_vtg:
-        logger.error(f"volume_to_gifti or gifti_to_trimesh failed for {volume_path.name}: {e_vtg}", exc_info=True)
-    finally:
-        if temp_gii_path.exists(): temp_gii_path.unlink(missing_ok=True)
-
-    if not isinstance(mesh, trimesh.Trimesh) or (hasattr(mesh, 'is_empty') and mesh.is_empty):
-        logger.warning(f"Mesh from {volume_path.name} is not a valid Trimesh object or is empty after initial conversion. Type: {type(mesh)}")
-        return False 
+def run_voxel2mesh(
+    input_nifti_path: Path,
+    output_stl_path: Path,
+    logger: logging.Logger,
+    verbose: bool = False,
+    threshold_value: Optional[float] = 0.5, 
+    blocky: bool = False
+) -> bool:
+    logger.info(f"Running voxel2mesh: {input_nifti_path.name} -> {output_stl_path.name}")
+    cmd = ["voxel2mesh"]
+    if blocky:
+        cmd.append("-blocky")
+    if threshold_value is not None and not blocky:
+        cmd.extend(["-threshold", str(threshold_value)])
     
+    cmd.extend(["-force"]) # Overwrite output if it exists
+    cmd.extend([str(input_nifti_path), str(output_stl_path)])
+
     try:
-        logger.debug(f"Initial mesh for {output_mesh_path.name}: {len(mesh.vertices)} verts, {len(mesh.faces)} faces. Watertight: {mesh.is_watertight if hasattr(mesh, 'is_watertight') else 'N/A'}")
-        mesh.process(validate=True) 
-        if not isinstance(mesh, trimesh.Trimesh) or mesh.is_empty:
-             logger.error(f"Mesh became invalid or empty after mesh.process() for {output_mesh_path.name}! Reverting to pre-process state if possible or failing.")
-             return False 
-        logger.debug(f"After mesh.process for {output_mesh_path.name}, Watertight: {mesh.is_watertight if hasattr(mesh, 'is_watertight') else 'N/A'}")
-
-        if hasattr(mesh, 'is_watertight') and not mesh.is_watertight:
-            logger.debug(f"Attempting to fill holes for non-watertight mesh {output_mesh_path.name}...")
-            trimesh.repair.fill_holes(mesh)
-            logger.info(f"After fill_holes for {output_mesh_path.name}, Watertight: {mesh.is_watertight if hasattr(mesh, 'is_watertight') else 'N/A'}")
-            if not isinstance(mesh, trimesh.Trimesh) or mesh.is_empty:
-                 logger.error(f"Mesh became invalid or empty after fill_holes for {output_mesh_path.name}!")
-                 return False
-
-        if not no_smooth:
-            logger.info(f"Attempting Taubin smoothing for {output_mesh_path.name}...")
-            if mesh.vertices.shape[0] > 0 and mesh.faces.shape[0] > 0: 
-                smoothed_mesh_candidate = trimesh.smoothing.filter_taubin(mesh, iterations=10, lamb=0.5, nu=-0.53)
-                if isinstance(smoothed_mesh_candidate, trimesh.Trimesh) and not smoothed_mesh_candidate.is_empty:
-                    mesh = smoothed_mesh_candidate
-                    logger.debug(f"Successfully applied Taubin smoothing to {output_mesh_path.name}.")
-                else:
-                    logger.warning(f"Taubin smoothing for {output_mesh_path.name} returned invalid/empty. Using pre-smoothing state.")
-            else:
-                logger.warning(f"Skipping Taubin smoothing for {output_mesh_path.name} as mesh is invalid/empty pre-smoothing.")
-            if not isinstance(mesh, trimesh.Trimesh) or mesh.is_empty:
-                logger.error(f"Mesh became invalid or empty after smoothing block for {output_mesh_path.name}!")
-                return False
-        logger.debug(f"After smoothing block for {output_mesh_path.name}, type(mesh) is {type(mesh)}")
-        
-        logger.debug(f"Attempting to fix normals for {output_mesh_path.name}...")
-        mesh.fix_normals(multibody=True)
-        if not isinstance(mesh, trimesh.Trimesh) or mesh.is_empty:
-            logger.error(f"Mesh became invalid or empty after fix_normals for {output_mesh_path.name}!")
-            return False
-        logger.debug(f"After fix_normals for {output_mesh_path.name}, type(mesh) is {type(mesh)}")
-        
-        is_trimesh = isinstance(mesh, trimesh.Trimesh)
-        watertight_status = mesh.is_watertight if hasattr(mesh, 'is_watertight') else 'N/A'
-        logger.debug(f"Preparing to export {output_mesh_path.name}. Mesh final check - Type: {type(mesh)}, Is Trimesh: {is_trimesh}, Watertight: {watertight_status}")
-
-        if not is_trimesh:
-             logger.error(f"Mesh variable is NOT a Trimesh object before export for {output_mesh_path.name}. Type: {type(mesh)}")
-             return False
-
-        output_mesh_path.parent.mkdir(parents=True, exist_ok=True)
-        mesh.export(str(output_mesh_path))
-        if output_mesh_path.exists() and output_mesh_path.stat().st_size > 0:
-             logger.info(f"Successfully exported mesh: {output_mesh_path}")
-             return True
+        output_stl_path.parent.mkdir(parents=True, exist_ok=True) # Ensure output directory exists
+        run_cmd(cmd, verbose=verbose)
+        if output_stl_path.exists() and output_stl_path.stat().st_size > 0:
+            logger.info(f"Successfully created mesh with voxel2mesh: {output_stl_path.name}")
+            return True
         else:
-             logger.error(f"Mesh export for {output_mesh_path.name} failed or file is empty.")
-             return False
-
-    except AttributeError as e_attrib_export:
-        logger.error(f"AttributeError during processing or export of {output_mesh_path.name}: {e_attrib_export}. Mesh type: {type(mesh)}", exc_info=True)
-        return False
-    except Exception as e_export:
-        logger.error(f"Failed to process or export mesh {output_mesh_path.name}: {e_export}", exc_info=True)
+            logger.error(f"voxel2mesh ran but output STL {output_stl_path.name} not created or is empty.")
+            try: # Check if input was empty
+                img_check = nib.load(str(input_nifti_path))
+                if np.sum(img_check.get_fdata()) == 0:
+                    logger.warning(f"Input NIfTI {input_nifti_path.name} to voxel2mesh was empty.")
+            except Exception: pass
+            return False
+    except Exception as e:
+        logger.error(f"voxel2mesh command failed for {input_nifti_path.name}: {e}", exc_info=verbose)
         return False
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -593,7 +298,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mni_template", type=str, default=str(DEFAULT_MNI_TEMPLATE_PATH) if DEFAULT_MNI_TEMPLATE_PATH else None,
                         help="Path to MNI152 T1 1mm brain template for AC-PC alignment. "
                              f"Default tries FSLDIR ({MNI_TEMPLATE_NAME_DEFAULT}).")
-    parser.add_argument("--output_dir", default="./multi_material_slabs",
+    parser.add_argument("--output_dir", default="./multi_material_slabs_acpc_stls", # Changed default to reflect new output space
                         help="Base output directory for final STL components and intermediate slab volumes.")
     parser.add_argument("--work_dir", default=None,
                         help="Directory for all intermediate files. If None, a temporary one is created under output_dir.")
@@ -607,19 +312,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--voxel_resolution", type=float, default=0.5,
                         help="Voxel size (mm) for the high-resolution AC-PC master grid.")
     parser.add_argument("--pv_threshold", type=float, default=0.5,
-                        help="Threshold for binarizing partial volume images from mesh2voxel.")
-    parser.add_argument("--no_final_mesh_smoothing", action="store_true",
-                        help="Disable Taubin smoothing on the final component meshes (STLs).")
+                        help="Threshold for binarizing partial volume images from mesh2voxel (Step 4).")
+    parser.add_argument("--voxel2mesh_threshold", type=float, default=0.5,
+                        help="Threshold for voxel2mesh when generating final STLs from AC-PC material volumes (Step 8).")
+    parser.add_argument("--voxel2mesh_blocky", action="store_true",
+                        help="Use the -blocky option for voxel2mesh, creating voxel-face meshes instead of smooth marching cubes.")
     parser.add_argument("--skip_outer_csf", action="store_true", help="Skip generation of the outer CSF component.")
     parser.add_argument("--no_clean", action="store_true", help="Keep work directory if it was temporary.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable detailed logging.")
-    parser.add_argument("--flatten_caps_tolerance_mm", type=float, default=0.5,
-                        help="EXPERIMENTAL: If set (e.g. 0.5), attempts to flatten mesh caps by snapping vertices. "
-                             "Value is the tolerance in mm for selecting cap vertices in AC-PC space. "
-                             "Requires fslpy for accurate transformations.")
-    parser.add_argument("--output_final_slabs_in_acpc_space", action="store_true",
-                        help="If set, the final output slab meshes will be in ACPC space after cap flattening. "
-                             "Otherwise, they are in native T1w space (default). Meshing always occurs from native T1w volumes.")
     return parser
 
 
@@ -628,13 +328,12 @@ def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_out
     L.info(f"Target AC-PC aligned voxel resolution: {args.voxel_resolution} mm")
     L.info(f"Slab thickness: {args.slab_thickness}mm, Orientation (AC-PC): {args.slab_orientation}")
     L.info(f"BrainMask inflation: {args.brain_mask_inflate_mm}mm")
-    if args.output_final_slabs_in_acpc_space:
-        L.info("Final slab meshes will be output in ACPC space (after cap flattening if enabled).")
-    else:
-        L.info("Final slab meshes will be output in Native T1w space (after cap flattening if enabled).")
+    L.info(f"voxel2mesh settings: threshold={args.voxel2mesh_threshold}, blocky={args.voxel2mesh_blocky}")
+    L.info("Final slab STLs will be generated in AC-PC space.")
 
-    mrtrix_cmds = ["mrgrid", "mesh2voxel"]
+    mrtrix_cmds = ["mrgrid", "mesh2voxel", "voxel2mesh"] # Added voxel2mesh
     fsl_cmds = ["flirt", "fslroi", "robustfov", "convert_xfm"]
+    # ANTs no longer strictly required if resampling step is gone, but good to keep for other tools
     ants_cmds = ["antsApplyTransforms"] 
     require_cmds(mrtrix_cmds + fsl_cmds + ants_cmds, logger=L)
 
@@ -646,12 +345,12 @@ def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_out
     cropped_full_vol_dir = work_dir / "04_cropped_full_acpc_masks"
     volumetric_slabs_acpc_dir = work_dir / "05_volumetric_slabs_acpc_nifti"
     material_slabs_acpc_vol_dir = work_dir / "06_material_slabs_acpc_volumes_nifti"
-    material_slabs_native_vol_dir = work_dir / "07_material_slabs_native_volumes_nifti"
-    temp_ants_xfm_dir = work_dir / "08_temp_ants_transforms" # For temporary transform files for ANTs
+    # Removed: material_slabs_native_vol_dir
+    # Removed: temp_ants_xfm_dir
     
     dirs_to_create = [acpc_align_dir, parent_surf_gen_dir, full_vol_voxelized_dir,
                    full_vol_binarized_dir, cropped_full_vol_dir, volumetric_slabs_acpc_dir,
-                   material_slabs_acpc_vol_dir, material_slabs_native_vol_dir, temp_ants_xfm_dir]
+                   material_slabs_acpc_vol_dir] # Removed native and ants_temp dirs
         
     for d_path in dirs_to_create:
         d_path.mkdir(parents=True, exist_ok=True)
@@ -686,51 +385,26 @@ def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_out
     
     runlog["steps"].append(f"AC-PC T1w: {t1w_acpc_aligned_path.name}, Native-to-ACPC FSL XFM: {t1w_to_acpc_fsl_mat_path.name}")
 
-    acpc_to_native_fsl_mat_path = acpc_align_dir / f"{actual_flirt_src_path.name.replace('.nii.gz','').replace('.nii','')}_acpc_to_native.mat"
-    if not invert_fsl_transform(t1w_to_acpc_fsl_mat_path, acpc_to_native_fsl_mat_path, L, args.verbose):
-        L.error("Failed to invert AC-PC alignment FSL transform."); return False
-    runlog["steps"].append(f"Inverse FSL XFM (ACPC->Native): {acpc_to_native_fsl_mat_path.name}")
-
     # --- Derive World-to-World Affines ---
+    # native_to_acpc_world_affine is needed for Step 4
     native_to_acpc_world_affine: Optional[np.ndarray] = None
-    acpc_to_native_world_affine: Optional[np.ndarray] = None
-
     if FSLPY_AVAILABLE: 
-        L.info("Attempting to derive world-to-world affines using fslpy...")
+        L.info("Attempting to derive native-to-ACPC world-to-world affine using fslpy...")
         native_to_acpc_world_affine = get_flirt_world_to_world_affine(
             fsl_flirt_mat_path=t1w_to_acpc_fsl_mat_path,
             src_image_path=actual_flirt_src_path, 
-            ref_image_path=mni_template_for_acpc,
+            ref_image_path=mni_template_for_acpc, # MNI template is the reference for AC-PC space
             logger=L
         )
         if native_to_acpc_world_affine is not None:
-            L.info("Successfully derived native-to-ACPC world affine. Calculating its inverse.")
-            try:
-                acpc_to_native_world_affine = np.linalg.inv(native_to_acpc_world_affine)
-                L.info("Successfully calculated ACPC-to-native world affine (inverse).")
-            except np.linalg.LinAlgError as e_inv:
-                L.error(f"Failed to invert native-to-ACPC world affine: {e_inv}. "
-                        "This will affect cap flattening and ANTs resampling.", exc_info=True) # Updated message
-                acpc_to_native_world_affine = None 
+            L.info("Successfully derived native-to-ACPC world affine.")
         else:
-            L.error("Failed to derive native-to-ACPC world affine using fslpy. Cap flattening and ANTs resampling will be impacted.")
-            acpc_to_native_world_affine = None 
+            L.error("Failed to derive native-to-ACPC world affine using fslpy. Voxelization in Step 4 might be misaligned.")
+            runlog["warnings"].append("Failed to derive native-to-ACPC world affine. Potential misalignment in Step 4.")
     else: 
-        L.warning("fslpy is not available. World-to-world affines cannot be reliably computed. "
-                  "Step 4 (voxelization) may be misaligned. Cap flattening and ANTs resampling will be disabled if they rely on these.")
-        runlog["warnings"].append("fslpy not available. Critical affine transforms skipped. Potential misalignment and cap flattening/ANTs resampling disabled.")
-    
-    if args.flatten_caps_tolerance_mm is not None:
-        if native_to_acpc_world_affine is None:
-            L.warning("Disabling cap flattening as native_to_acpc_world_affine could not be computed.")
-            args.flatten_caps_tolerance_mm = None
-        elif not args.output_final_slabs_in_acpc_space and acpc_to_native_world_affine is None:
-            L.warning("Disabling cap flattening for native output as acpc_to_native_world_affine could not be computed.")
-            args.flatten_caps_tolerance_mm = None
-    
-    if acpc_to_native_world_affine is None: # This is needed for ANTs resampling
-        L.warning("ACPC-to-Native world affine is not available. ANTs-based resampling (Step 8) will be skipped, "
-                  "which may lead to misaligned native slabs.")
+        L.warning("fslpy is not available. Native-to-ACPC world-to-world affine cannot be reliably computed from FSL .mat. "
+                  "Step 4 (voxelization) may be misaligned if relying on this transform.")
+        runlog["warnings"].append("fslpy not available. native_to_acpc_world_affine might be inaccurate. Potential Step 4 misalignment.")
 
 
     # --- Step 2: Creating High-Resolution Master AC-PC Template ---
@@ -747,7 +421,8 @@ def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_out
 
     # --- Step 3: Generating full parent T1-space surfaces ---
     L.info("--- Step 3: Generating full parent T1-space surfaces (Trimesh objects) ---")
-    parent_meshes_trimesh: Dict[str, Optional[trimesh.Trimesh]] = {}
+    # (This section remains largely the same as it generates native T1w Trimesh objects)
+    parent_meshes_trimesh: Dict[str, Optional[Any]] = {} # Changed to Any for trimesh
     L.info(f"Generating BrainMask surface with {args.brain_mask_inflate_mm}mm inflation...")
     bm_mesh = generate_single_brain_mask_surface(
         args.subjects_dir, args.subject_id, "T1",
@@ -756,6 +431,7 @@ def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_out
         tmp_dir=parent_surf_gen_dir / "bm_work", logger=L, verbose=args.verbose)
     if bm_mesh and not bm_mesh.is_empty: parent_meshes_trimesh["BrainMask"] = bm_mesh
     else: L.warning("BrainMask surface generation failed or resulted in an empty mesh.")
+    
     L.info("Generating Pial Complex components...")
     pial_cortical_for_complex, pial_other_for_complex_from_preset, _ = parse_preset("pial_brain")
     pial_other_explicit_for_pial_complex = set()
@@ -768,15 +444,14 @@ def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_out
         [], [], args.run, args.session, args.verbose, str(parent_surf_gen_dir / "pial_complex_work"))
     for k, v_mesh in pial_comp_meshes.items():
         if v_mesh and not v_mesh.is_empty: parent_meshes_trimesh[k] = v_mesh
+    
     L.info("Generating White Complex components...")
     white_cortical_for_complex, white_other_for_complex_from_preset, _ = parse_preset("white_brain")
     white_other_explicit_for_white_complex = set()
     for item in white_other_for_complex_from_preset:
         if item == "cerebellum_wm": white_other_explicit_for_white_complex.add("cerebellum_wm")
-        elif item == "cerebellum":
-            white_other_explicit_for_white_complex.add("cerebellum_wm") 
+        elif item == "cerebellum": white_other_explicit_for_white_complex.add("cerebellum_wm") 
         else: white_other_explicit_for_white_complex.add(item)
-
     white_comp_meshes = generate_brain_surfaces(
         args.subjects_dir, args.subject_id, "T1",
         tuple(white_cortical_for_complex), list(white_other_explicit_for_white_complex),
@@ -807,12 +482,19 @@ def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_out
     temp_obj_export_dir_for_acpc_voxelization = full_vol_voxelized_dir / "temp_acpc_aligned_objs"
     temp_obj_export_dir_for_acpc_voxelization.mkdir(parents=True, exist_ok=True)
 
-    for parent_name, trimesh_native_obj in valid_parent_meshes_trimesh.items():
-        if trimesh_native_obj is None: continue 
+    for parent_name, trimesh_native_obj_any in valid_parent_meshes_trimesh.items():
+        if trimesh_native_obj_any is None: continue 
+        trimesh_native_obj = trimesh_native_obj_any # Cast to trimesh.Trimesh if needed, assuming it is
 
         safe_name = parent_name.replace("_", "-").replace(" ", "-")
         temp_acpc_aligned_surf_obj_path = temp_obj_export_dir_for_acpc_voxelization / f"{args.subject_id}_desc-{safe_name}_full_surf_acpc-aligned.obj"
+        
+        # Explicitly use trimesh type for copy and transform
+        if not hasattr(trimesh_native_obj, 'copy') or not hasattr(trimesh_native_obj, 'apply_transform'):
+            L.error(f"Object for parent_name '{parent_name}' is not a Trimesh object. Skipping voxelization.")
+            continue
         mesh_to_voxelize_acpc = trimesh_native_obj.copy()
+
 
         if native_to_acpc_world_affine is not None:
             L.debug(f"Transforming native surface '{parent_name}' to AC-PC space before voxelization.")
@@ -849,8 +531,10 @@ def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_out
     if not full_acpc_binarized_masks: L.error("No full surfaces voxelized/binarized. Aborting."); return False
     L.info(f"Voxelized and binarized {len(full_acpc_binarized_masks)} full parent surfaces onto AC-PC grid.")
 
+
     # --- Step 5: Determining global bounding box for cropping ---
     L.info("--- Step 5: Determining global bounding box for cropping full AC-PC volumes ---")
+    # (This section remains the same)
     overall_min_coords_vox: Optional[np.ndarray] = None
     overall_max_coords_vox: Optional[np.ndarray] = None
     for struct_name, mask_path in full_acpc_binarized_masks.items():
@@ -868,33 +552,19 @@ def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_out
     L.info(f"Global voxel bounding box for cropping (min/max xyz, inclusive): {overall_min_coords_vox} / {overall_max_coords_vox}")
 
     cropped_acpc_binarized_masks: Dict[str, Path] = {}
-    cropped_acpc_grid_affine_for_caps: Optional[np.ndarray] = None 
-    
     for struct_name, full_mask_path in full_acpc_binarized_masks.items():
         safe_name = struct_name.replace("_", "-").replace(" ", "-") 
         cropped_path = cropped_full_vol_dir / f"{args.subject_id}_desc-{safe_name}_full_acpc_mask_cropped.nii.gz"
         if crop_nifti_volume_fslroi(full_mask_path, cropped_path, overall_min_coords_vox, overall_max_coords_vox, L, args.verbose):
             cropped_acpc_binarized_masks[struct_name] = cropped_path
-            if cropped_acpc_grid_affine_for_caps is None: 
-                try:
-                    cropped_img_for_affine = nib.load(str(cropped_path))
-                    cropped_acpc_grid_affine_for_caps = cropped_img_for_affine.affine
-                    L.info(f"Using affine from {cropped_path.name} for ideal cap coordinate calculations.")
-                except Exception as e_aff:
-                    L.error(f"Could not load affine from {cropped_path.name}: {e_aff}. Cap flattening may be unreliable.")
-                    runlog["warnings"].append(f"Failed to get AC-PC cropped grid affine for cap flattening: {e_aff}")
         else: L.warning(f"Failed to crop {full_mask_path.name}.")
 
     if not cropped_acpc_binarized_masks: L.error("No volumes successfully cropped. Aborting."); return False
     L.info(f"Cropped {len(cropped_acpc_binarized_masks)} full AC-PC volumes.")
 
-    if args.flatten_caps_tolerance_mm is not None and cropped_acpc_grid_affine_for_caps is None:
-        L.error("Cap flattening enabled, but could not determine affine of the cropped AC-PC grid. Disabling feature.")
-        runlog["warnings"].append("Failed to get AC-PC cropped grid affine; cap flattening disabled.")
-        args.flatten_caps_tolerance_mm = None 
-
     # --- Step 6: Performing volumetric slicing (in AC-PC space) ---
     L.info("--- Step 6: Performing volumetric slicing (in AC-PC space) ---")
+    # (This section remains the same)
     orientation_map = {"axial": 2, "coronal": 1, "sagittal": 0}
     slice_axis_idx = orientation_map[args.slab_orientation]
     runlog["slice_axis_idx_acpc"] = slice_axis_idx
@@ -914,8 +584,7 @@ def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_out
     num_slabs_generated = 0
     current_slab_start_voxel_in_cropped = 0 
     volumetric_slabs_acpc_struct_files: Dict[int, Dict[str, Path]] = {} 
-    slab_definitions_voxel_acpc: List[Dict[str, Any]] = [] 
-
+    
     total_extent_cropped_vox = cropped_vol_dims_xyz[slice_axis_idx]
 
     while current_slab_start_voxel_in_cropped < total_extent_cropped_vox:
@@ -925,11 +594,6 @@ def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_out
         actual_slab_thickness_this_iteration_vox = min(slab_thickness_voxels, total_extent_cropped_vox - current_slab_start_voxel_in_cropped)
         if actual_slab_thickness_this_iteration_vox <= 0: break 
 
-        slab_definitions_voxel_acpc.append({
-            "slab_idx": slab_idx,
-            "start_vox": current_slab_start_voxel_in_cropped,
-            "thickness_vox": actual_slab_thickness_this_iteration_vox
-        })
         runlog["steps"].append(f"Defining AC-PC slab {slab_idx}: start_vox={current_slab_start_voxel_in_cropped}, thickness_vox={actual_slab_thickness_this_iteration_vox}")
 
         L.info(f"--- >> Volumetrically Slicing AC-PC Slab Index {slab_idx} (voxels {current_slab_start_voxel_in_cropped} to "
@@ -954,6 +618,7 @@ def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_out
     L.info(f"Processed {num_slabs_generated} volumetric AC-PC slabs definitions.")
     runlog["num_slabs_defined"] = num_slabs_generated
 
+
     # --- Loop through each defined slab index for material processing ---
     for slab_idx in range(num_slabs_generated):
         L.info(f"--- >>> Processing Materials for Slab {slab_idx + 1}/{num_slabs_generated} <<< ---")
@@ -962,6 +627,7 @@ def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_out
             L.warning(f"Slab {slab_idx}: No AC-PC component NIfTI files found for material definition. Skipping slab."); continue
 
         # --- Step 7: Volumetric Math for Materials (in AC-PC space for this slab) ---
+        # (This section remains largely the same, it defines AC-PC NIfTI material volumes)
         M_KeyStruct_Slab_i_data_dict: Dict[str, Optional[np.ndarray]] = {}
         example_acpc_slab_nifti_path_for_saving_template: Optional[Path] = None
 
@@ -1015,164 +681,81 @@ def main_wf(args: argparse.Namespace, L: logging.Logger, work_dir: Path, stl_out
         except Exception as e_load_tmpl:
             L.error(f"Slab {slab_idx}: Failed to load AC-PC NIfTI template {example_acpc_slab_nifti_path_for_saving_template}: {e_load_tmpl}. Skipping."); continue
 
-        material_acpc_slab_volumes_to_process: Dict[str, Path] = {} 
+        # This dictionary will hold the paths to the final AC-PC material NIfTIs for this slab
+        final_material_volumes_for_meshing: Dict[str, Path] = {} 
 
         if not args.skip_outer_csf:
             vol_outer_csf_acpc = vol_subtract_numpy(m_bm_acpc, m_pc_acpc)
             p_acpc = material_slabs_acpc_vol_dir / f"{args.subject_id}_slab-{slab_idx}_desc-OuterCSF_acpc.nii.gz"
-            if save_numpy_as_nifti(vol_outer_csf_acpc, acpc_slab_template_img_for_saving, p_acpc, L): material_acpc_slab_volumes_to_process["OuterCSF"] = p_acpc
+            if save_numpy_as_nifti(vol_outer_csf_acpc, acpc_slab_template_img_for_saving, p_acpc, L): 
+                final_material_volumes_for_meshing["OuterCSF"] = p_acpc
         
         vol_gm_acpc = vol_subtract_numpy(m_pc_acpc, m_wc_acpc)
         p_acpc = material_slabs_acpc_vol_dir / f"{args.subject_id}_slab-{slab_idx}_desc-GreyMatter_acpc.nii.gz"
-        if save_numpy_as_nifti(vol_gm_acpc, acpc_slab_template_img_for_saving, p_acpc, L): material_acpc_slab_volumes_to_process["GreyMatter"] = p_acpc
+        if save_numpy_as_nifti(vol_gm_acpc, acpc_slab_template_img_for_saving, p_acpc, L): 
+            final_material_volumes_for_meshing["GreyMatter"] = p_acpc
 
         vol_vent_final_acpc = m_vent_acpc.copy() if m_vent_acpc is not None else zeros_for_fallback_acpc_slab.copy()
         p_acpc_vent = material_slabs_acpc_vol_dir / f"{args.subject_id}_slab-{slab_idx}_desc-Ventricles_acpc.nii.gz"
-        if save_numpy_as_nifti(vol_vent_final_acpc, acpc_slab_template_img_for_saving, p_acpc_vent, L): material_acpc_slab_volumes_to_process["Ventricles"] = p_acpc_vent
+        if save_numpy_as_nifti(vol_vent_final_acpc, acpc_slab_template_img_for_saving, p_acpc_vent, L): 
+            final_material_volumes_for_meshing["Ventricles"] = p_acpc_vent
 
         vol_sgm_final_acpc = m_sgm_acpc.copy() if m_sgm_acpc is not None else zeros_for_fallback_acpc_slab.copy()
         p_acpc_sgm = material_slabs_acpc_vol_dir / f"{args.subject_id}_slab-{slab_idx}_desc-SubcorticalGrey_acpc.nii.gz"
-        if save_numpy_as_nifti(vol_sgm_final_acpc, acpc_slab_template_img_for_saving, p_acpc_sgm, L): material_acpc_slab_volumes_to_process["SubcorticalGrey"] = p_acpc_sgm
+        if save_numpy_as_nifti(vol_sgm_final_acpc, acpc_slab_template_img_for_saving, p_acpc_sgm, L): 
+            final_material_volumes_for_meshing["SubcorticalGrey"] = p_acpc_sgm
         
         working_wm_acpc = m_wc_acpc.copy() if m_wc_acpc is not None else zeros_for_fallback_acpc_slab.copy()
         working_wm_acpc = vol_subtract_numpy(working_wm_acpc, vol_vent_final_acpc)
         working_wm_acpc = vol_subtract_numpy(working_wm_acpc, vol_sgm_final_acpc)
         vol_wm_final_acpc = working_wm_acpc
         p_acpc_wm = material_slabs_acpc_vol_dir / f"{args.subject_id}_slab-{slab_idx}_desc-WhiteMatter_acpc.nii.gz"
-        if save_numpy_as_nifti(vol_wm_final_acpc, acpc_slab_template_img_for_saving, p_acpc_wm, L): material_acpc_slab_volumes_to_process["WhiteMatter"] = p_acpc_wm
+        if save_numpy_as_nifti(vol_wm_final_acpc, acpc_slab_template_img_for_saving, p_acpc_wm, L): 
+            final_material_volumes_for_meshing["WhiteMatter"] = p_acpc_wm
+        
         runlog["steps"].append(f"Slab {slab_idx}: Volumetric material definition in AC-PC space completed.")
 
 
-        # --- Step 8: Resample AC-PC Material Slabs to Native T1w Space (ALWAYS performed before meshing) ---
-        L.info(f"--- Slab {slab_idx}: Resampling AC-PC material slabs to native T1w space for meshing ---")
-        final_material_volumes_to_mesh: Dict[str, Path] = {} 
-
-        native_space_reference_for_final_resampling = actual_flirt_src_path 
-        L.info(f"Using '{native_space_reference_for_final_resampling.name}' as the reference grid for native space resampling (Step 8).")
-
-        for mat_name, acpc_vol_path in material_acpc_slab_volumes_to_process.items():
-            native_vol_path = material_slabs_native_vol_dir / f"{args.subject_id}_slab-{slab_idx}_desc-{mat_name}_native_resampled.nii.gz"
-            
-            if acpc_to_native_world_affine is not None: 
-                # Prefer ANTs if the world affine is available
-                if resample_volume_to_native_space_ants( 
-                    acpc_vol_path, native_vol_path,
-                    native_space_reference_for_final_resampling,
-                    acpc_to_native_world_affine, 
-                    temp_ants_xfm_dir, # Pass the dedicated temp dir for ANTs xfms
-                    L, interpolation_method="MultiLabel", verbose=args.verbose # Use MultiLabel for masks
-                ):
-                    final_material_volumes_to_mesh[mat_name] = native_vol_path
-                else:
-                    L.warning(f"Failed to resample {mat_name} for slab {slab_idx} to native space using ANTs. Skipping meshing.")
-            else:
-                # Fallback or error if acpc_to_native_world_affine is None
-                L.error(f"Skipping native resampling of {mat_name} for slab {slab_idx} as world affine for ANTs is missing. "
-                        "This will likely result in misaligned or missing final STLs for this material.")
-                runlog["warnings"].append(f"Slab {slab_idx}, Mat {mat_name}: Skipped native resampling (ANTs), world affine missing.")
-
-        runlog["steps"].append(f"Slab {slab_idx}: Resampling of materials to native space (attempted with ANTs) completed.")
-
-        if not final_material_volumes_to_mesh:
-            L.warning(f"Slab {slab_idx}: No material volumes successfully resampled to native space. Skipping meshing and flattening for this slab.")
-            continue
-
-        # --- Step 9: Meshing Final Material Slab Volumes (from Native Space) & Optional Cap Flattening ---
-        final_output_space_str = "ACPC" if args.output_final_slabs_in_acpc_space else "Native"
-        L.info(f"--- Slab {slab_idx}: Meshing native-space material slab volumes. Final output space for STLs: {final_output_space_str} ---")
+        # --- NEW Step 8: Meshing AC-PC Material Slabs using voxel2mesh ---
+        L.info(f"--- Slab {slab_idx}: Meshing AC-PC material slab volumes using voxel2mesh ---")
         
         material_vol_names_for_mesh = ["OuterCSF", "GreyMatter", "WhiteMatter", "Ventricles", "SubcorticalGrey"]
-        if args.skip_outer_csf and "OuterCSF" in material_vol_names_for_mesh: material_vol_names_for_mesh.remove("OuterCSF")
+        if args.skip_outer_csf and "OuterCSF" in material_vol_names_for_mesh: 
+            material_vol_names_for_mesh.remove("OuterCSF")
 
-        ideal_cap_coords_world_for_slab: Optional[Tuple[float, float]] = None
-        current_slab_def_info = next((item for item in slab_definitions_voxel_acpc if item["slab_idx"] == slab_idx), None)
-
-        can_flatten_this_slab = (
-            args.flatten_caps_tolerance_mm is not None and
-            native_to_acpc_world_affine is not None and 
-            (acpc_to_native_world_affine is not None or args.output_final_slabs_in_acpc_space) and 
-            cropped_acpc_grid_affine_for_caps is not None and
-            current_slab_def_info is not None
-        )
-
-        if can_flatten_this_slab:
-            ideal_cap_coords_world_for_slab = get_ideal_cap_coords_world_acpc(
-                slab_def_vox_start=current_slab_def_info["start_vox"],
-                slab_def_vox_thickness=current_slab_def_info["thickness_vox"],
-                slice_axis_idx_acpc=slice_axis_idx,
-                cropped_acpc_grid_affine=cropped_acpc_grid_affine_for_caps, 
-                logger=L
-            )
-            if ideal_cap_coords_world_for_slab:
-                 L.info(f"Slab {slab_idx}: Target Ideal AC-PC World Cap Coords (axis {slice_axis_idx}): "
-                        f"Min={ideal_cap_coords_world_for_slab[0]:.4f}, Max={ideal_cap_coords_world_for_slab[1]:.4f}")
-            else:
-                L.warning(f"Slab {slab_idx}: Could not calculate ideal cap coordinates. Disabling flattening for this slab's materials.")
-                can_flatten_this_slab = False 
-        elif args.flatten_caps_tolerance_mm is not None: 
-            L.warning(f"Slab {slab_idx}: Prerequisites for cap flattening not met (e.g. missing affines). Skipping for this slab's materials.")
-
+        if not final_material_volumes_for_meshing:
+            L.warning(f"Slab {slab_idx}: No AC-PC material volumes were defined or saved. Skipping meshing for this slab.")
+            continue
 
         for mat_name in material_vol_names_for_mesh:
-            native_vol_path_for_mesh = final_material_volumes_to_mesh.get(mat_name) 
-            if native_vol_path_for_mesh and native_vol_path_for_mesh.exists():
-                stl_path = stl_output_base_dir / f"{args.subject_id}_slab-{slab_idx}_desc-{mat_name}_material_space-{final_output_space_str.lower()}.stl"
+            acpc_vol_path_for_mesh = final_material_volumes_for_meshing.get(mat_name) 
+            if acpc_vol_path_for_mesh and acpc_vol_path_for_mesh.exists():
+                # Output STLs will be in AC-PC space
+                stl_path = stl_output_base_dir / f"{args.subject_id}_slab-{slab_idx}_desc-{mat_name}_material_space-acpc.stl"
                 
-                mesh_generated_successfully = vol_to_mesh(native_vol_path_for_mesh, stl_path, args.no_final_mesh_smoothing, L)
+                mesh_generated_successfully = run_voxel2mesh(
+                    input_nifti_path=acpc_vol_path_for_mesh,
+                    output_stl_path=stl_path,
+                    logger=L,
+                    verbose=args.verbose,
+                    threshold_value=args.voxel2mesh_threshold,
+                    blocky=args.voxel2mesh_blocky
+                )
 
-                if mesh_generated_successfully and can_flatten_this_slab and ideal_cap_coords_world_for_slab:
-                    L.info(f"Attempting to flatten caps for {stl_path.name} (Slab {slab_idx}, Mat {mat_name}). Final output space: {final_output_space_str}")
-                    
-                    try:
-                        native_mesh_for_flattening = trimesh.load_mesh(str(stl_path)) 
-                        if not native_mesh_for_flattening.is_empty:
-                            ideal_coord_min, ideal_coord_max = ideal_cap_coords_world_for_slab
-                            
-                            flattened_mesh_final_space = flatten_mesh_caps_acpc(
-                                mesh=native_mesh_for_flattening, 
-                                native_to_acpc_world_affine=native_to_acpc_world_affine, 
-                                acpc_to_native_world_affine=acpc_to_native_world_affine, 
-                                ideal_coord_min_acpc=ideal_coord_min,
-                                ideal_coord_max_acpc=ideal_coord_max,
-                                slice_axis_idx_acpc=slice_axis_idx,
-                                tolerance_mm=args.flatten_caps_tolerance_mm, 
-                                logger=L,
-                                output_space_is_acpc=args.output_final_slabs_in_acpc_space
-                            )
-                            if flattened_mesh_final_space and not flattened_mesh_final_space.is_empty:
-                                if not np.array_equal(flattened_mesh_final_space.vertices, native_mesh_for_flattening.vertices) or \
-                                   (args.output_final_slabs_in_acpc_space and native_to_acpc_world_affine is not None): 
-                                    L.info(f"Caps/Space potentially modified for {stl_path.name}. Exporting updated version to {final_output_space_str} space.")
-                                    flattened_mesh_final_space.export(str(stl_path)) 
-                                    runlog["steps"].append(f"Caps flattened and mesh saved in {final_output_space_str} for {mat_name} slab {slab_idx}")
-                                else:
-                                    L.info(f"Flattening did not change vertices for {stl_path.name} (and output is native). Original native mesh retained.")
-                            elif flattened_mesh_final_space is None or flattened_mesh_final_space.is_empty: 
-                                L.warning(f"Cap flattening returned None or an empty mesh for {stl_path.name}. Original (native) mesh retained.")
-                        else:
-                            L.warning(f"Loaded mesh for flattening {stl_path.name} is empty. Skipping flattening.")
-                    except FileNotFoundError:
-                        L.error(f"Mesh file {stl_path.name} not found for loading to flatten caps.")
-                    except Exception as e_flatten:
-                        L.error(f"Error during cap flattening for {stl_path.name}: {e_flatten}. Original (native) mesh retained.", exc_info=True)
-                        runlog["warnings"].append(f"Cap flattening failed for {mat_name} slab {slab_idx}: {str(e_flatten)[:100]}")
-
-                if stl_path.exists() and stl_path.stat().st_size > 0:
+                if mesh_generated_successfully and stl_path.exists() and stl_path.stat().st_size > 0:
                     runlog["output_files"].append(str(stl_path))
-                elif mesh_generated_successfully: 
-                     L.warning(f"Mesh {stl_path.name} was generated but is now missing or empty post-flattening attempt.")
-                     runlog["warnings"].append(f"Mesh {stl_path.name} missing/empty post-flattening attempt.")
+                    L.info(f"Successfully generated STL for {mat_name}, slab {slab_idx}: {stl_path.name}")
+                elif mesh_generated_successfully: # implies stl_path check failed
+                     L.warning(f"voxel2mesh reported success for {mat_name} slab {slab_idx} but STL file {stl_path.name} is missing or empty.")
+                     runlog["warnings"].append(f"voxel2mesh success but STL missing/empty: {stl_path.name}")
+                else: # mesh_generated_successfully is False
+                    L.warning(f"Failed to generate mesh for {mat_name}, slab {slab_idx} from {acpc_vol_path_for_mesh.name}.")
+                    runlog["warnings"].append(f"voxel2mesh failed for {mat_name} slab {slab_idx} ({acpc_vol_path_for_mesh.name})")
             else:
-                L.warning(f"Native space volume for {mat_name} slab {slab_idx} not found or not saved. Skipping mesh generation.")
-        runlog["steps"].append(f"Slab {slab_idx}: Meshing of final materials from native space completed. Output STLs in {final_output_space_str} space.")
+                L.debug(f"AC-PC volume for {mat_name} slab {slab_idx} not found in 'final_material_volumes_for_meshing' or does not exist. Skipping mesh generation.")
+        
+        runlog["steps"].append(f"Slab {slab_idx}: Meshing of AC-PC material volumes with voxel2mesh completed.")
     
-    if not args.no_clean and temp_ants_xfm_dir.exists(): # Clean up ANTs temp dir
-        try:
-            shutil.rmtree(temp_ants_xfm_dir)
-            L.debug("Cleaned up temporary ANTs transform directory for Step 8.")
-        except OSError as e_clean_ants:
-            L.warning(f"Could not remove temporary ANTs transform directory: {e_clean_ants}")
-
     L.info("Multi-material slab component generation workflow finished successfully.")
     return True
 
@@ -1203,7 +786,6 @@ def main():
                      "Ensure FSLDIR is set and FSL is installed correctly, or provide --mni_template.")
         sys.exit(1)
 
-
     final_stl_output_dir = Path(args.output_dir).resolve()
     final_stl_output_dir.mkdir(parents=True, exist_ok=True)
     success = False
@@ -1216,6 +798,11 @@ def main():
         try:
             success = main_wf(args, L_main, work_dir_path, final_stl_output_dir, runlog)
             if args.no_clean : L_main.info("--no_clean is active. Retaining work directory.") 
+            else: # Clean work_dir if not --no_clean and work_dir was specified
+                if work_dir_path.exists(): 
+                    L_main.info(f"Cleaning specified work directory: {work_dir_path}")
+                    try: shutil.rmtree(work_dir_path)
+                    except Exception as e_clean_spec: L_main.warning(f"Could not clean specified work_dir {work_dir_path}: {e_clean_spec}")
         except Exception as e:
             L_main.error(f"An error occurred in main_wf with specified work_dir: {e}", exc_info=True)
             runlog["warnings"].append(f"CRITICAL_ERROR: {str(e)}")
